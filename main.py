@@ -4,7 +4,7 @@ import torch
 from torch import nn
 import torch.distributed as dist
 # import torch.optim as optim
-from adafactor import Adafactor, AdafactorTP
+from adafactor import Adafactor, AdafactorTP, AdafactorTP_v0_1, AdafactorTpZero2
 import initialize as fs_init
 
 # dist env
@@ -44,7 +44,7 @@ def main():
     a = 0.1
     b = 1.0
     error = 0.1
-    batch_size = 512
+    batch_size = 64
     # Weight and bias shape; Weight [8, 8], Bias 
     H, W = 4096, 4096
     # x = torch.arange(1.0, 1.0 + 2 * 2 * 1.0, 1.0).reshape(2, 2)
@@ -54,11 +54,13 @@ def main():
     #     print(f"x mean dim -2 {x.mean(dim=-2)}")
     
     # Data
-    x = torch.arange(0.1, 0.1 + batch_size * H * 0.1, 0.1).reshape(batch_size, H)
-    y_true = a * x + b + (torch.randn(batch_size, 1) * error) # shape [batch size, H]
+    x = torch.arange(0.1, 0.1 + batch_size * H * 0.1, 0.1).reshape(batch_size, H).cuda(device=device)
+    y_true = a * x + b + (torch.randn(batch_size, 1).cuda(device=device) * error) # shape [batch size, H]
+    y_true = y_true.cuda(device=device)
 
-    model_base = nn.Linear(H, W)  
-    model_tp = model_base
+    model_base = nn.Linear(H, W).to(device)  
+    model_tp = model_base.to(device)
+    model_tp_zero2 = model_base.to(device)
     # weight [H*W]
     # bias [W]
     
@@ -67,6 +69,7 @@ def main():
     # ==============================
     # torch.cuda.synchronize()
     # print("Adafactor")
+    # print(f"Base weight before {list(model_base.parameters())[0]}")
     optimizer_base = Adafactor(model_base.parameters())
     loss_fn_base = nn.MSELoss()
     
@@ -75,18 +78,45 @@ def main():
     loss_base = loss_fn_base(y_pred_base, y_true)
     loss_base.backward()
     optimizer_base.step()
+    # print(f"Base weight after {list(model_base.parameters())[0]}")
 
+    # # ==============================
+    # # Adafactor Tensor Parallel v0.0
+    # # ==============================
+    # optimizer_tp = AdafactorTP(model_tp.parameters())
+    # loss_fn_tp = loss_fn_basedddd
+
+    # optimizer_tp.zero_grad()
+    # y_pred_tp = model_tp(x)
+    # loss_tp = loss_fn_tp(y_pred_tp, y_true)
+    # loss_tp.backward()
+    # optimizer_tp.step()
+    
     # ==============================
-    # Adafactor Tensor Parallel
+    # Adafactor Tensor Parallel v0.1
     # ==============================
-    optimizer_tp = AdafactorTP(model_tp.parameters())
+    # print(f"TP weight before {list(model_tp.parameters())[0]}")
+    optimizer_tp = AdafactorTP_v0_1(model_tp.parameters(), weight_height=H, weight_width=W)
     loss_fn_tp = loss_fn_base
 
     optimizer_tp.zero_grad()
-    y_pred_tp = model_tp(x)
-    loss_tp = loss_fn_tp(y_pred_tp, y_true)
-    loss_tp.backward()
+    y_pred_tp_1 = model_tp(x)
+    loss_tp_1 = loss_fn_tp(y_pred_tp_1, y_true)
+    loss_tp_1.backward()
     optimizer_tp.step()
+    # print(f"TP weight after {list(model_tp.parameters())[0]}")
+
+    # # ==============================
+    # # Adafactor Tensor Parallel + Zero Stage 2
+    # # ==============================
+    # optimizer_tp_zero2 = AdafactorTpZero2(model_tp_zero2.parameters())
+    # loss_fn_tp_zero2 = loss_fn_base
+
+    # optimizer_tp_zero2.zero_grad()
+    # y_pred_tp_zero2 = model_tp_zero2(x)
+    # loss_tp_zero2 = loss_fn_tp_zero2(y_pred_tp_zero2, y_true)
+    # loss_tp_zero2.backward()
+    # optimizer_tp_zero2.step()
 
     # ==============================
     # Correctness Verify
@@ -140,7 +170,7 @@ def main():
         
         base_runtime += base_end - base_start
         tp_runtime += tp_end - tp_start
-    print(f"base avg runtime {base_runtime / niter}; tp avg runtime {tp_runtime / niter}")
+    print(f"base avg runtime {(base_runtime / niter) * 10.0**3} ms; tp avg runtime {(tp_runtime / niter)*10.0**3} ms")
     
 if __name__ == "__main__":
     main()
