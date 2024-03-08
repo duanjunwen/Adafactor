@@ -70,7 +70,7 @@ def main():
     # torch.cuda.synchronize()
     # print("Adafactor")
     # print(f"Base weight before {list(model_base.parameters())[0]}")
-    optimizer_base = Adafactor(model_base.parameters())
+    optimizer_base = Adafactor(model_base.parameters(), beta1 = 0.9, weight_decay=0.1)
     loss_fn_base = nn.MSELoss()
     
     optimizer_base.zero_grad()
@@ -96,7 +96,7 @@ def main():
     # Adafactor Tensor Parallel v0.1
     # ==============================
     # print(f"TP weight before {list(model_tp.parameters())[0]}")
-    optimizer_tp = AdafactorTP_v0_1(model_tp.parameters(), weight_height=H, weight_width=W)
+    optimizer_tp = AdafactorTP_v0_1(model_tp.parameters(),  beta1 = 0.9,  weight_decay=0.1, weight_height=H, weight_width=W)
     loss_fn_tp = loss_fn_base
 
     optimizer_tp.zero_grad()

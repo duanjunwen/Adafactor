@@ -794,6 +794,13 @@ class AdafactorTP_v0_1(Optimizer):
                     #     print(f"Grad: {grad}")
                     #     print(f"Grad shape: {grad.shape}")
                     
+                    # shift idx
+                    # split weight alone last dim
+                    col_start = self.weight_width // self.tensor_parallel_size * self.localRank
+                    col_end = self.weight_width // self.tensor_parallel_size * (self.localRank + 1)
+                    row_start = 0
+                    row_end = self.weight_height
+                    
                     grad_parallel = scatter_to_model_parallel_region(grad) 
                     # print(f"Grad_parallel: {grad_parallel}")
                     # print(f"Grad shape: {grad_parallel.shape}")
@@ -856,10 +863,30 @@ class AdafactorTP_v0_1(Optimizer):
                     update_parallel.mul_(lr)
 
                     # update = gather_from_model_parallel_region(update_parallel)
-                    update = update_parallel.repeat(self.weight_height, self.weight_width)
-                    ### update 变成 Nan
-                    # print(f"update: {update}")
-                    # print(f"update shape: {update.shape}")
+
+                    if use_first_moment:
+                        # exp_avg = state["exp_avg"]
+                        # print(f"exp_avg shape: {exp_avg.shape}, update shape {update.shape}, update_parallel shape {update_parallel.shape}")
+                        # exp_avg.mul_(group["beta1"]).add_(update, alpha=(1 - group["beta1"]))
+                        # update = exp_avg
+                        
+                        exp_avg_parallel = state["exp_avg"][row_start:row_end, col_start:col_end]
+                        # print(f"update_parallel shape {update_parallel.shape}; exp_avg_parallel shape {exp_avg_parallel.shape}")
+                        exp_avg_parallel.mul_(group["beta1"]).add_(update_parallel, alpha=(1 - group["beta1"]))
+                        update_parallel = exp_avg_parallel
+
+                    if group["weight_decay"] != 0:
+                        p_data_fp32_parallel = p_data_fp32[row_start:row_end, col_start:col_end]
+                        p_data_fp32_parallel.add_(p_data_fp32_parallel, alpha=(-group["weight_decay"] * lr))
+                        # p_data_fp32.add_(p_data_fp32, alpha=(-group["weight_decay"] * lr))
+                        # print(f"p_data_fp32 shape {p_data_fp32.shape}")
+                        
+                    # p_data_fp32.add_(-update)
+                    p_data_fp32_parallel.add_(-update_parallel)
+                    # print(f"p_data_fp32 shape:{p_data_fp32.shape}; update shape:{update.shape}")
+
+                    if p.dtype in {torch.float16, torch.bfloat16}:
+                        p[row_start:row_end, col_start:col_end].copy_(p_data_fp32_parallel)
 
                 else:
                     # 若使用adam
@@ -870,19 +897,19 @@ class AdafactorTP_v0_1(Optimizer):
                     update.div_((self._rms(update) / group["clip_threshold"]).clamp_(min=1.0))
                     update.mul_(lr)
 
-                if use_first_moment:
-                    exp_avg = state["exp_avg"]
-                    exp_avg.mul_(group["beta1"]).add_(update, alpha=(1 - group["beta1"]))
-                    update = exp_avg
+                    if use_first_moment:
+                        exp_avg = state["exp_avg"]
+                        exp_avg.mul_(group["beta1"]).add_(update, alpha=(1 - group["beta1"]))
+                        update = exp_avg
 
-                if group["weight_decay"] != 0:
-                    p_data_fp32.add_(p_data_fp32, alpha=(-group["weight_decay"] * lr))
+                    if group["weight_decay"] != 0:
+                        p_data_fp32.add_(p_data_fp32, alpha=(-group["weight_decay"] * lr))
 
-                p_data_fp32.add_(-update)
-                # print(f"p_data_fp32 shape:{p_data_fp32.shape}; update shape:{update.shape}")
+                    p_data_fp32.add_(-update)
+                    # print(f"p_data_fp32 shape:{p_data_fp32.shape}; update shape:{update.shape}")
 
-                if p.dtype in {torch.float16, torch.bfloat16}:
-                    p.copy_(p_data_fp32)
+                    if p.dtype in {torch.float16, torch.bfloat16}:
+                        p.copy_(p_data_fp32)
 
         return loss
 
