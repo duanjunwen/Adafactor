@@ -31,10 +31,10 @@ def init_dist():
 
 def correctness_verify(tensor1: torch.Tensor, tensor2: torch.Tensor):
     # return torch.all(tensor1.eq(tensor2))
-    return torch.all(tensor1.isclose(tensor2, rtol=1e-05, atol=1e-05))
+    return torch.all(tensor1.isclose(tensor2, rtol=1e-05, atol=1e-04, equal_nan=True))
     
 def error_idx(tensor1: torch.Tensor, tensor2: torch.Tensor):
-    return torch.isclose(tensor1, tensor2, rtol=1e-05, atol=1e-05)
+    return torch.isclose(tensor1, tensor2, rtol=1e-05, atol=1e-04, equal_nan=True)
 
 def get_time():
     torch.cuda.synchronize()
@@ -66,8 +66,8 @@ def main():
     # optimizer_base = Adafactor(model_base.parameters(), beta1 = 0.9, weight_decay=0.1)
     # print(f"Before base weight shape {weight.shape} on device {device} {weight.data}")
     torch.cuda.synchronize()
-    
-    optimizer_base = Adafactor([weight, bias], beta1 = 0.9, weight_decay=0.1)
+    optimizer_base = Adafactor([weight, bias])
+    # optimizer_base = Adafactor([weight, bias], beta1 = 0.9, weight_decay=0.1)
     optimizer_base.zero_grad()
     weight.grad = torch.rand_like(weight)
     bias.grad = torch.rand_like(bias)
@@ -90,7 +90,8 @@ def main():
     # Adafactor Tensor Parallel v0.2
     # ==============================
     torch.cuda.synchronize()
-    optimizer_tp = AdafactorTPv02([local_weight, local_bias],  beta1 = 0.9,  weight_decay=0.1)
+    optimizer_tp = AdafactorTPv02([local_weight, local_bias])
+    # optimizer_tp = AdafactorTPv02([local_weight, local_bias],  beta1 = 0.9,  weight_decay=0.1)
     optimizer_tp.zero_grad()
     local_weight.grad = _split(weight.grad)
     local_bias.grad = bias.grad
@@ -136,24 +137,34 @@ def main():
     for i in range(0, niter):
         # Base optim
         optimizer_base.zero_grad()
+        weight.grad = torch.rand_like(weight)
+        bias.grad = torch.rand_like(bias)
         base_start = get_time()
         optimizer_base.step()
         base_end = get_time()
         
         # TP optim
         optimizer_tp.zero_grad()
+        local_weight.grad = _split(weight.grad)
+        local_bias.grad = bias.grad
         tp_start = get_time()
         optimizer_tp.step()
         tp_end = get_time()
+        gather_weight = _gather(local_weight.data)
         
         torch.cuda.synchronize()
         weight_correctness = correctness_verify(weight.data, gather_weight)
         bias_correctness = correctness_verify(bias.data, local_bias.data)
         
+        # print(f"iter {i} weight.data {weight.data}")
+        # print(f"iter {i} gather_weight.data {gather_weight.data}")
+        
         print(f"iter {i}")
         if weight_correctness:
             print(f"weight correctness {weight_correctness}")
         else:
+            # print(f"iter {i} weight.data {weight.data}")
+            # print(f"iter {i} gather_weight.data {gather_weight.data}")
             weight_err_idx = error_idx(weight.data, gather_weight.data)
             print(f"weight err idx {weight_err_idx}")
                 

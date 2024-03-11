@@ -10,7 +10,8 @@ import os
 from mappings import (
     scatter_to_model_parallel_region,
     reduce_from_model_parallel_region,
-    gather_from_model_parallel_region
+    gather_from_model_parallel_region,
+    _reduce
 )
 
 # Adafactor From transformer.optim
@@ -257,6 +258,7 @@ class Adafactor(Optimizer):
                 
                 state["step"] += 1
                 state["RMS"] = self._rms(p_data_fp32)
+                # print(f"RMS base {state['RMS']}")
                 lr = self._get_lr(group, state)
                 
                 # 参数Beta 2
@@ -962,7 +964,10 @@ class AdafactorTPv02(Optimizer):
             "warmup_init": warmup_init,
         }
         super().__init__(params, defaults)
+        self.tensor_parallel_size = fs_init.get_model_parallel_world_size()  # 可用于tensor parallel的GPU
+        self.tensor_parallel_group = fs_init.get_model_parallel_group() # 可用于tensor parallel的Group class
         self.localRank = int(os.environ['LOCAL_RANK'])  # 当前GPU id
+        self.worldSize = int(os.environ['WORLD_SIZE'])  # 总调用GPU
 
     @staticmethod
     def _get_lr(param_group, param_state):
@@ -996,8 +1001,8 @@ class AdafactorTPv02(Optimizer):
         # exp_avg_sq_col shape [8]
         r_factor = (exp_avg_sq_row / exp_avg_sq_row.mean(dim=-1, keepdim=True)).rsqrt_().unsqueeze(-1)
         c_factor = exp_avg_sq_col.unsqueeze(-2).rsqrt()
-        # r_factor shape [8,1]
-        # c_factor shape [1,8]
+        # r_factor shape [H,1]
+        # c_factor shape [1,W/N]
         # print(f"Row col shape After {r_factor.shape, c_factor.shape}")
         return torch.mul(r_factor, c_factor)
 
@@ -1100,6 +1105,17 @@ class AdafactorTPv02(Optimizer):
                 
                 state["step"] += 1
                 state["RMS"] = self._rms(p_data_fp32)
+                
+                # rms_tensor = torch.tensor([self._rms(p_data_fp32)]).to(self.localRank)
+                # dist.all_reduce(rms_tensor, group=fs_init.get_model_parallel_group())
+                # state["RMS"] = rms_tensor.div(self.tensor_parallel_size)[0]
+                # print(f"RMS {state['RMS']}")
+                
+                # print(f"RMS {rms_tensor}")
+                # dist.all_reduce(rms_tensor, group=fs_init.get_model_parallel_group())
+                # # rms_tensor = _reduce(input_=rms_tensor).div(self.tensor_parallel_size)
+                # print(f"RMS reduce {rms_tensor.div(self.tensor_parallel_size)}")
+                
                 lr = self._get_lr(group, state)
                 
                 # 参数Beta 2
@@ -1124,6 +1140,7 @@ class AdafactorTPv02(Optimizer):
                     # Approximation of exponential moving average of square of gradient
                     update = self._approx_sq_grad(exp_avg_sq_row, exp_avg_sq_col)
                     update.mul_(grad)
+                    # print(f"{update}")
                 else:
                     # 若使用adam
                     exp_avg_sq = state["exp_avg_sq"]
@@ -1132,6 +1149,11 @@ class AdafactorTPv02(Optimizer):
                     update = exp_avg_sq.rsqrt().mul_(grad)
                 
                 #  (Line No.8)
+                # rms_update_tensor = torch.tensor([self._rms(update)]).to(self.localRank)
+                # dist.all_reduce(rms_update_tensor, group=fs_init.get_model_parallel_group())
+                # # state["RMS"] = rms_update_tensor.div(self.tensor_parallel_size)[0]
+                # update.div_((rms_update_tensor.div(self.tensor_parallel_size)[0] / group["clip_threshold"]).clamp_(min=1.0))
+                
                 update.div_((self._rms(update) / group["clip_threshold"]).clamp_(min=1.0))
                 update.mul_(lr)
 
@@ -1142,8 +1164,11 @@ class AdafactorTPv02(Optimizer):
 
                 if group["weight_decay"] != 0:
                     p_data_fp32.add_(p_data_fp32, alpha=(-group["weight_decay"] * lr))
-
-                p_data_fp32.add_(-update)
+                
+                if factored:  
+                    # print(f"Before p_data_fp32 on {self.localRank} {p_data_fp32}")
+                    p_data_fp32.add_(-update)
+                    # print(f"After p_data_fp32 on {self.localRank} {p_data_fp32}")
 
                 if p.dtype in {torch.float16, torch.bfloat16}:
                     p.copy_(p_data_fp32)
