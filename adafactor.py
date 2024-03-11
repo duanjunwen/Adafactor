@@ -588,7 +588,7 @@ class AdafactorTP(Optimizer):
 
 
 # Adafactor Tensor parallel v0.1
-class AdafactorTP_v0_1(Optimizer):
+class AdafactorTPv01(Optimizer):
     def __init__(
         self,
         params,
@@ -794,7 +794,7 @@ class AdafactorTP_v0_1(Optimizer):
                     #     print(f"Grad: {grad}")
                     #     print(f"Grad shape: {grad.shape}")
                     
-                    # shift idx
+                    # shift idx for weight
                     # split weight alone last dim
                     col_start = self.weight_width // self.tensor_parallel_size * self.localRank
                     col_end = self.weight_width // self.tensor_parallel_size * (self.localRank + 1)
@@ -889,11 +889,15 @@ class AdafactorTP_v0_1(Optimizer):
                         p[row_start:row_end, col_start:col_end].copy_(p_data_fp32_parallel)
 
                 else:
-                    # 若使用adam
+                    # Adam
+                    # bias or other 1dim param use Adam
                     update = ((grad**2) + group["eps"][0]).to(self.localRank)
+                    # print(f"update shape {update.shape}, grad shape {grad.shape}")
                     exp_avg_sq = state["exp_avg_sq"]
+                    # print(f"exp_avg_sq shape {exp_avg_sq.shape}")
                     exp_avg_sq.mul_(beta2t).add_(update, alpha=(1.0 - beta2t))
                     update = exp_avg_sq.rsqrt().mul_(grad)
+                    # RMS均方根
                     update.div_((self._rms(update) / group["clip_threshold"]).clamp_(min=1.0))
                     update.mul_(lr)
 
@@ -910,14 +914,22 @@ class AdafactorTP_v0_1(Optimizer):
 
                     if p.dtype in {torch.float16, torch.bfloat16}:
                         p.copy_(p_data_fp32)
+                    
+                    # col_start = self.weight_width // self.tensor_parallel_size * self.localRank
+                    # col_end = self.weight_width // self.tensor_parallel_size * (self.localRank + 1)
+                    # grad_parallel = grad[col_start, col_end]
+                    # update_parallel = ((grad_parallel**2) + group["eps"][0])
+                    # exp_avg_sq_parallel = state["exp_avg_sq"][col_start, col_end]
+                    # exp_avg_sq_parallel.mul_(beta2t).add_(update_parallel, alpha=(1.0 - beta2t))
+                    # update_parallel = exp_avg_sq_parallel.rsqrt().mul_(grad_parallel)
+                    # update_parallel
+                    
 
         return loss
 
 
-
-
-# Adafactor Tensor parallel (To Be Cont)
-class AdafactorTpZero2(Optimizer):
+# Adafactor Tensor parallel v0.2(input split as Weight [H, W/N])
+class AdafactorTPv02(Optimizer):
     def __init__(
         self,
         params,
@@ -949,10 +961,6 @@ class AdafactorTpZero2(Optimizer):
             "warmup_init": warmup_init,
         }
         super().__init__(params, defaults)
-        self.tensor_parallel_size = fs_init.get_model_parallel_world_size()  # 可用于tensor parallel的GPU
-        self.tensor_parallel_group = fs_init.get_model_parallel_group() # 可用于tensor parallel的Group class
-        self.localRank = int(os.environ['LOCAL_RANK'])  # 当前GPU id
-        self.worldSize = int(os.environ['WORLD_SIZE'])  # 总调用GPU
 
     @staticmethod
     def _get_lr(param_group, param_state):
@@ -989,7 +997,8 @@ class AdafactorTpZero2(Optimizer):
         # c_factor shape [1,8]
         # print(f"Row col shape After {r_factor.shape, c_factor.shape}")
         return torch.mul(r_factor, c_factor)
-    
+
+        
     @torch.no_grad()
     def step(self, closure=None):
         """
@@ -1020,9 +1029,11 @@ class AdafactorTpZero2(Optimizer):
             "warmup_init"
         }
         """
+        # print(f"self.param_groups", self.param_groups,"\n")
         for group in self.param_groups:
             # update weight & bias
             for p in group["params"]:
+                # print(f"p.grad {p.grad}\n")
                 if p.grad is None:
                     continue
                 """
@@ -1051,13 +1062,13 @@ class AdafactorTpZero2(Optimizer):
                 'RMS'
                 }
                 """
-                
                 state = self.state[p]
                 # print(f"state {list(state)}")
                 grad_shape = grad.shape
                 # print(f"grad_shape {grad_shape}")
 
                 factored, use_first_moment = self._get_options(group, grad_shape)
+                print(f"factor {factored}, use_first_moment { use_first_moment}")
                 # State Initialization
                 if len(state) == 0:
                     state["step"] = 0
@@ -1090,92 +1101,22 @@ class AdafactorTpZero2(Optimizer):
                 
                 # 参数Beta 2
                 beta2t = 1.0 - math.pow(state["step"], group["decay_rate"])
-                # print(f"beta2t {beta2t}")
+                # print(f"{state['step'], group['decay_rate'], math.pow(state['step'], group['decay_rate'])}")
                 
-                """
-                p (group["params"]) is weight
-                update shape [H, W]
-                
-                p (group["params"]) is bias
-                update shape [W]
-                """
-                update = ((grad**2) + group["eps"][0]).to(self.localRank)
-                # print(f"Update shape {update.shape}")
-                # torch.cuda.synchronize()
+                update = (grad**2) + group["eps"][0]
                 if factored:  
                     # 若使用adafactor
-                    exp_avg_sq_row = state["exp_avg_sq_row"].to(self.localRank)
-                    exp_avg_sq_col = state["exp_avg_sq_col"].to(self.localRank)
+                    # print(f"factor\n")
+                    exp_avg_sq_row = state["exp_avg_sq_row"]
+                    exp_avg_sq_col = state["exp_avg_sq_col"]
                     
-                    # print(f"Row Type: {type(exp_avg_sq_row)}, shape: {exp_avg_sq_row.shape}")
-                    # print(f"Col Type: {type(exp_avg_sq_col)}, shape: {exp_avg_sq_col.shape}")
+                    # (Line No.5)计算行指数平均
+                    exp_avg_sq_row.mul_(beta2t).add_(update.mean(dim=-1), alpha=(1.0 - beta2t))
+                    # (Line No.6)计算列指数平均
+                    exp_avg_sq_col.mul_(beta2t).add_(update.mean(dim=-2), alpha=(1.0 - beta2t))
                     
-                    # if (self.localRank == 0):
-                    #     print(f"exp_avg_sq_row {exp_avg_sq_row}")
-                    #     print(f"exp_avg_sq_row {exp_avg_sq_col}")
-                    #     print(f"beta2t {beta2t}")
-                    #     print(f"update {update}")
-                    #     print(f"update mean dim -1 {update.mean(dim=-1)}")  # 倒数第1个维度
-                    #     print(f"update mean dim -2 {update.mean(dim=-2)}")  # 倒数第2个维度
-                    #     print(f"alpha {(1.0 - beta2t)}")
-                    
-                    # ==============================
-                    #  Without Tensor Parallel
-                    # ==============================
-                    # # (Line No.5)计算行指数平均
-                    # exp_avg_sq_row.mul_(beta2t).add_(update.mean(dim=-1), alpha=(1.0 - beta2t))
-                    # # exp_avg_sq_row[8] * val + update[8,8]
-                    
-                    # # (Line No.6)计算列指数平均
-                    # exp_avg_sq_col.mul_(beta2t).add_(update.mean(dim=-2), alpha=(1.0 - beta2t))
-                    
-                    # if (self.localRank == 0):
-                    #     print(f"exp_avg_sq_row res {exp_avg_sq_row}")
-                    #     print(f"exp_avg_sq_col res {exp_avg_sq_col}")
-                
-                        
-                    # ==============================
-                    #  Tensor Parallel
-                    # ==============================
-                    # print(f"device {self.localRank}\n update\n {update}")
-                    # update [H, W] split by last dim
-                    update_parallel = scatter_to_model_parallel_region(update)
-                    # print(f"update shape {update.shape}")
-                    # print(f"update_parallel shape {update_parallel.shape}")
-                    # print(f"device {self.localRank} update_parallel\n {update_parallel}")
-                    
-                    # Cal update_row_mean on each device
-                    update_row_mean_parallel = update_parallel.mean(dim=-1)
-                    
-                    # Cal update_col_mean on each device
-                    update_col_mean_parallel = update_parallel.mean(dim=-2)
-                    
-                    # print(f"device {self.localRank} update_row_mean parallel\n {update_row_mean_parallel}")
-                    # All-reduce update_row_mean div tp_GPU num , then get mean
-                    update_row_mean = reduce_from_model_parallel_region(update_row_mean_parallel).div_(self.tensor_parallel_size)
-                    # print(f"device {self.localRank} update_row_mean reduce\n {update_row_mean}")
-                    
-                    # All-gather update_col_mean
-                    update_col_mean = gather_from_model_parallel_region(update_col_mean_parallel)
-                    # print(f"row_mean device{update_row_mean.get_device()}")
-                    # print(f"col_mean device{update_col_mean.get_device()}")
-                    # print(f"sq_row device{exp_avg_sq_row.get_device()}")
-                    # print(f"sq_col device{exp_avg_sq_col.get_device()}")
-                    # print(f"update device{update.get_device()}")
-                    # print(f"grad device{grad.get_device()}")
-                    
-                    # Cal exp_avg_sq_row
-                    exp_avg_sq_row.mul_(beta2t).add_(update_row_mean, alpha=(1.0 - beta2t))
-                    
-                    # Cal exp_avg_sq_col
-                    exp_avg_sq_col.mul_(beta2t).add_(update_col_mean, alpha=(1.0 - beta2t))
-                    
-                    # if (self.localRank == 0):
-                    #     print(f"exp_avg_sq_row res {exp_avg_sq_row}")
-                    #     print(f"exp_avg_sq_col res {exp_avg_sq_col}")
-                    
-                    # # (Line No.7)近似计算，提前开根号
-                    # # Approximation of exponential moving average of square of gradient
+                    # (Line No.7)近似计算，提前开根号
+                    # Approximation of exponential moving average of square of gradient
                     update = self._approx_sq_grad(exp_avg_sq_row, exp_avg_sq_col)
                     update.mul_(grad)
                 else:
@@ -1203,3 +1144,4 @@ class AdafactorTpZero2(Optimizer):
                     p.copy_(p_data_fp32)
 
         return loss
+
