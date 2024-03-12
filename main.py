@@ -32,8 +32,10 @@ def init_dist():
 def correctness_verify(tensor1: torch.Tensor, tensor2: torch.Tensor):
     # return torch.all(tensor1.eq(tensor2))
     return torch.all(tensor1.isclose(tensor2, rtol=1e-05, atol=1e-04, equal_nan=True))
+    # return torch.testing.assert_close(tensor1, tensor2)
     
 def error_idx(tensor1: torch.Tensor, tensor2: torch.Tensor):
+    # return tensor1.eq(tensor2)
     return torch.isclose(tensor1, tensor2, rtol=1e-05, atol=1e-04, equal_nan=True)
 
 def get_time():
@@ -133,7 +135,7 @@ def main():
     # ==============================
     # Run training epoch
     # ==============================
-    niter = 10
+    niter = 100
     for i in range(0, niter):
         # Base optim
         optimizer_base.zero_grad()
@@ -178,6 +180,7 @@ def main():
         base_runtime += base_end - base_start
         tp_runtime += tp_end - tp_start
     print(f"base avg runtime {(base_runtime / niter) * 10.0**3} ms; tp avg runtime {(tp_runtime / niter)*10.0**3} ms")
+    print(f"Speed Up Rate {base_runtime/tp_runtime}")
     
 if __name__ == "__main__":
     main()
