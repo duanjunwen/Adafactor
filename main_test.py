@@ -26,38 +26,21 @@ from prettytable import PrettyTable
 
 # dist env
 def init_dist():
-    rank = int(os.environ['RANK'])  # 当前进程的全局排名（Global Rank）
-    local_rank = int(os.environ['LOCAL_RANK'])  # 表示当前进程在本地节点中的排名（Local Rank）。
-    # single node GPU num :LOCAL RANK node0:{LOCAL_RANK0-3}, node1:{LOCAL_RANK4-7}
-    world_size = int(os.environ['WORLD_SIZE'])  # 表示分布式训练中总共的进程数。
+    rank = int(os.environ['RANK'])
+    local_rank = int(os.environ['LOCAL_RANK'])
+    world_size = int(os.environ['WORLD_SIZE'])
 
     dist.init_process_group(world_size=world_size, rank=rank,
                             init_method="env://", backend="nccl")
-    # model_parallel_size_= world_size，GPU全部用于tensor parallism
     fs_init.initialize_model_parallel(model_parallel_size_= world_size)
     torch.cuda.set_device(local_rank)
 
 def correctness_verify(tensor1: torch.Tensor, tensor2: torch.Tensor):
-    # return torch.all(tensor1.eq(tensor2))
     return torch.all(tensor1.isclose(tensor2, rtol=1e-05, atol=1e-04, equal_nan=True))
     # return torch.testing.assert_close(tensor1, tensor2,  rtol=1e-05, atol=1e-04, equal_nan=True)
     
 def error_idx(tensor1: torch.Tensor, tensor2: torch.Tensor):
-    # return tensor1.eq(tensor2)
     return torch.isclose(tensor1, tensor2, rtol=1e-05, atol=1e-04, equal_nan=True)
-
-# def correctness_info_log(weight_correct :bool, bias_correct:bool):
-#     if weight_correctness:
-#         print(f"weight correctness {weight_correctness}")
-#     else:
-#         weight_err_idx = error_idx(weight.data, gather_weight.data)
-#         print(f"weight err idx {weight_err_idx}")
-#     if bias_correctness:
-#         print(f"bias correctness {bias_correctness}")
-#     else:
-#         bias_err_idx = error_idx(bias.data, local_bias.data)
-#         print(f"bias err idx {bias_err_idx}")
-#     return 0 
 
 def get_time():
     torch.cuda.synchronize()
@@ -72,12 +55,9 @@ def main():
     
     
     param_list = [((2**i)*64, (2**i)*64) for i  in range(0, 10)]
-    # print(param_list) 
     table = PrettyTable(['Version', 'weight shape', 'bias shape', 'Avg runtime(ms)',
                             'Speed Up Rate', 'Best Speed Up Rate'], float_format='.2')
     for (H,W) in param_list:
-        # H, W = 4096, 4096
-
         model_base = nn.Linear(H, W).to(device)  
         
         # base param
@@ -85,43 +65,30 @@ def main():
         # weight [W, H] [4, 2]
         # bias [W]  [4]
         weight, bias = model_base.weight, model_base.bias
-        # print(f"weight shape {weight.shape} {weight}")
-        # print(f"bias shape {bias.shape} {bias}")
+
         # tensor parallel param 
-        
         # local_weight [W, H/N] [4, 1]
         # local_bias [W]  [4]
         local_weight = _split(weight)
         local_weight = nn.Parameter(local_weight.clone().requires_grad_(True))
         local_bias = nn.Parameter(bias.clone().requires_grad_(True))
-        # print(f"local_weight shape {local_weight.shape} {local_weight}")
-        # print(f"local_bias shape {local_bias.shape} {local_bias}")
-        
+
         # local_weight [W*H/N] [4*1]
         # local_bias [W]  [4]
         # flatten param; TP first, then flatten ;
         local_weight_flatten = nn.Parameter(_split(weight).clone().flatten().requires_grad_(True))
         local_bias_flatten = nn.Parameter(bias.clone().flatten().requires_grad_(True))
-        # print(f"local_weight_flatten shape {local_weight_flatten.shape} {local_weight_flatten}")
-        # print(f"local_bias_flatten shape {local_bias_flatten.shape} {local_bias_flatten}")
-        
-        # print(f"correctness_verify weight {correctness_verify(local_weight.flatten(), local_weight_flatten)}") # step后梯度作为输入不变
-        
-
 
         # # ==============================
         # # Adafactor Base
         # # ==============================
-        # optimizer_base = Adafactor(model_base.parameters(), beta1 = 0.9, weight_decay=0.1)
-        # print(f"Before base weight shape {weight.shape} on device {device} {weight.data}")
         torch.cuda.synchronize()
         optimizer_base = Adafactor([weight, bias])
-        # optimizer_base = Adafactor([weight, bias], beta1 = 0.9, weight_decay=0.1)
         optimizer_base.zero_grad()
         weight.grad = torch.rand_like(weight)
         bias.grad = torch.rand_like(bias)
         optimizer_base.step()
-        # print(f"base weight shape {weight.shape} on device {device} {weight.data}")
+    
         # ==============================
         # Adafactor Tensor Parallel v0.1
         # ==============================
@@ -139,31 +106,22 @@ def main():
         # Adafactor Tensor Parallel v0.2
         # ==============================
         torch.cuda.synchronize()
-        # print(f"Before tp weight shape {local_weight.shape} on device {device} {local_weight.data}\n")
         optimizer_tp = AdafactorTPv02([local_weight, local_bias])
-        # optimizer_tp = AdafactorTPv02([local_weight, local_bias],  beta1 = 0.9,  weight_decay=0.1)
         optimizer_tp.zero_grad()
         local_weight.grad = _split(weight.grad).clone()
         local_bias.grad = bias.grad.clone()
-        # print(f"local_weight grad shape {local_weight.grad.shape}{local_weight.grad}")
         optimizer_tp.step()
-        # print(f"After tp weight shape {local_weight.shape} on device {device} {local_weight}\n")
-        # print(f"After tp bias shape {local_bias.shape} on device {device} {local_bias}\n")
-
+        
         # # ==============================
         # # Adafactor Tensor Parallel v0.3
         # # ==============================
         torch.cuda.synchronize()
-        # print(f"Before flatten weight shape {local_weight_flatten.shape} on device {device} {local_weight_flatten.data}\n")
         optimizer_zero2 = AdafactorTPv03([local_weight_flatten, local_bias_flatten], param_height = W, param_width = H)
         optimizer_zero2.zero_grad()
         local_weight_flatten.grad = _split(weight.grad).clone().flatten()
         local_bias_flatten.grad = bias.grad.clone().flatten()
         optimizer_zero2.step()
-        # print(f"correctness_verify weight grad {correctness_verify(local_weight.grad.flatten(), local_weight_flatten.grad)}") # step后梯度作为输入不变
-        # print(f"After flatten weight shape {local_weight_flatten.shape} on device {device} {local_weight_flatten.data}\n")
-        # print(f"After flatten bias shape {local_bias_flatten.shape} on device {device} {local_bias_flatten.data}\n")
-
+        
         # ==============================
         # Correctness Verify
         # ==============================
