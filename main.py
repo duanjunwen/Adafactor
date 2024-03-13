@@ -5,7 +5,13 @@ from torch import nn
 from torch.nn.parameter import Parameter
 import torch.distributed as dist
 # import torch.optim as optim
-from adafactor import Adafactor, AdafactorTP, AdafactorTPv01, AdafactorTPv02
+from adafactor import (
+    Adafactor, 
+    AdafactorTP, 
+    AdafactorTPv01, 
+    AdafactorTPv02,
+    AdafactorTPv03,
+)
 import initialize as fs_init
 
 from mappings import (
@@ -32,11 +38,24 @@ def init_dist():
 def correctness_verify(tensor1: torch.Tensor, tensor2: torch.Tensor):
     # return torch.all(tensor1.eq(tensor2))
     return torch.all(tensor1.isclose(tensor2, rtol=1e-05, atol=1e-04, equal_nan=True))
-    # return torch.testing.assert_close(tensor1, tensor2)
+    # return torch.testing.assert_close(tensor1, tensor2,  rtol=1e-05, atol=1e-04, equal_nan=True)
     
 def error_idx(tensor1: torch.Tensor, tensor2: torch.Tensor):
     # return tensor1.eq(tensor2)
     return torch.isclose(tensor1, tensor2, rtol=1e-05, atol=1e-04, equal_nan=True)
+
+# def correctness_info_log(weight_correct :bool, bias_correct:bool):
+#     if weight_correctness:
+#         print(f"weight correctness {weight_correctness}")
+#     else:
+#         weight_err_idx = error_idx(weight.data, gather_weight.data)
+#         print(f"weight err idx {weight_err_idx}")
+#     if bias_correctness:
+#         print(f"bias correctness {bias_correctness}")
+#     else:
+#         bias_err_idx = error_idx(bias.data, local_bias.data)
+#         print(f"bias err idx {bias_err_idx}")
+#     return 0 
 
 def get_time():
     torch.cuda.synchronize()
@@ -47,21 +66,43 @@ def main():
     device = int(os.environ['LOCAL_RANK'])
     world_size = int(os.environ['WORLD_SIZE'])
     init_dist()
+    tensor_parallel_size = fs_init.get_model_parallel_world_size()  # 可用于tensor parallel的GPU
     
-    # runtime test
-    base_start, base_end, base_runtime = 0, 0, 0
-    tp_start, tp_end, tp_runtime = 0, 0, 0
+    
     
     H, W = 4096, 4096
 
     model_base = nn.Linear(H, W).to(device)  
-    # weight [H*W]
-    # bias [W]
+    
+    # base param
+    # layer shape [H, W], then
+    # weight [W, H] [4, 2]
+    # bias [W]  [4]
     weight, bias = model_base.weight, model_base.bias
-
+    # print(f"weight shape {weight.shape} {weight}")
+    # print(f"bias shape {bias.shape} {bias}")
+    # tensor parallel param 
+    
+    # local_weight [W, H/N] [4, 1]
+    # local_bias [W]  [4]
     local_weight = _split(weight)
-    local_weight = nn.Parameter(local_weight.requires_grad_(True))
-    local_bias = nn.Parameter(bias.requires_grad_(True))
+    local_weight = nn.Parameter(local_weight.clone().requires_grad_(True))
+    local_bias = nn.Parameter(bias.clone().requires_grad_(True))
+    # print(f"local_weight shape {local_weight.shape} {local_weight}")
+    # print(f"local_bias shape {local_bias.shape} {local_bias}")
+    
+    # local_weight [W*H/N] [4*1]
+    # local_bias [W]  [4]
+    # flatten param; TP first, then flatten ;
+    local_weight_flatten = nn.Parameter(_split(weight).clone().flatten().requires_grad_(True))
+    local_bias_flatten = nn.Parameter(bias.clone().flatten().requires_grad_(True))
+    # print(f"local_weight_flatten shape {local_weight_flatten.shape} {local_weight_flatten}")
+    # print(f"local_bias_flatten shape {local_bias_flatten.shape} {local_bias_flatten}")
+    
+    # print(f"correctness_verify weight {correctness_verify(local_weight.flatten(), local_weight_flatten)}") # step后梯度作为输入不变
+    
+
+
     # # ==============================
     # # Adafactor Base
     # # ==============================
@@ -74,7 +115,7 @@ def main():
     weight.grad = torch.rand_like(weight)
     bias.grad = torch.rand_like(bias)
     optimizer_base.step()
-    
+    # print(f"base weight shape {weight.shape} on device {device} {weight.data}")
     # ==============================
     # Adafactor Tensor Parallel v0.1
     # ==============================
@@ -92,50 +133,87 @@ def main():
     # Adafactor Tensor Parallel v0.2
     # ==============================
     torch.cuda.synchronize()
+    # print(f"Before tp weight shape {local_weight.shape} on device {device} {local_weight.data}\n")
     optimizer_tp = AdafactorTPv02([local_weight, local_bias])
     # optimizer_tp = AdafactorTPv02([local_weight, local_bias],  beta1 = 0.9,  weight_decay=0.1)
     optimizer_tp.zero_grad()
-    local_weight.grad = _split(weight.grad)
-    local_bias.grad = bias.grad
+    local_weight.grad = _split(weight.grad).clone()
+    local_bias.grad = bias.grad.clone()
     # print(f"local_weight grad shape {local_weight.grad.shape}{local_weight.grad}")
     optimizer_tp.step()
-    # print(f"After local_weight shape {local_weight.shape} on {device}:{local_weight}")
+    # print(f"After tp weight shape {local_weight.shape} on device {device} {local_weight}\n")
+    # print(f"After tp bias shape {local_bias.shape} on device {device} {local_bias}\n")
 
     # # ==============================
     # # Adafactor Tensor Parallel v0.3
     # # ==============================
+    torch.cuda.synchronize()
+    # print(f"Before flatten weight shape {local_weight_flatten.shape} on device {device} {local_weight_flatten.data}\n")
+    optimizer_zero2 = AdafactorTPv03([local_weight_flatten, local_bias_flatten], param_height = W, param_width = H)
+    optimizer_zero2.zero_grad()
+    local_weight_flatten.grad = _split(weight.grad).clone().flatten()
+    local_bias_flatten.grad = bias.grad.clone().flatten()
+    optimizer_zero2.step()
+    # print(f"correctness_verify weight grad {correctness_verify(local_weight.grad.flatten(), local_weight_flatten.grad)}") # step后梯度作为输入不变
+    # print(f"After flatten weight shape {local_weight_flatten.shape} on device {device} {local_weight_flatten.data}\n")
+    # print(f"After flatten bias shape {local_bias_flatten.shape} on device {device} {local_bias_flatten.data}\n")
 
     # ==============================
     # Correctness Verify
     # ==============================
-    # torch.cuda.synchronize()
+    # tensor parallel gather data
     torch.cuda.synchronize()
     gather_weight = _gather(local_weight.data)
-    # print(f"weight.data shape {weight.data.shape} {weight.data}")
-    # print(f"gather_weight.data shape {gather_weight.data.shape} {gather_weight.data}")
-
     weight_correctness = correctness_verify(weight.data, gather_weight)
     bias_correctness = correctness_verify(bias.data, local_bias.data)
-    
+    # print(f"tp weight shape {gather_weight.shape} on device {device} {gather_weight.data}")
     if weight_correctness:
-        print(f"weight correctness {weight_correctness}")
+        print(f"V2 weight correctness {weight_correctness}")
     else:
         weight_err_idx = error_idx(weight.data, gather_weight.data)
-        print(f"weight err idx {weight_err_idx}")
-            
+        print(f"V2 weight err idx {weight_err_idx}")
     if bias_correctness:
-        print(f"bias correctness {bias_correctness}")
+        print(f"V2 bias correctness {bias_correctness}")
     else:
         bias_err_idx = error_idx(bias.data, local_bias.data)
-        print(f"bias err idx {bias_err_idx}")
-
+        print(f"V2 bias err idx {bias_err_idx}")
     
-  
+    # # tensor parallel & flatten view &gather data
+    torch.cuda.synchronize()
+    reshape_flatten_weight = local_weight_flatten.view(-1, H // tensor_parallel_size) # reshape
+    gather_flatten_weight = _gather(reshape_flatten_weight.data) # gather
+    # print(f"flatten weight shape {gather_flatten_weight.shape} on device {device} {gather_flatten_weight.data}")
+    # print(f"tp_weight shape {gather_weight.shape} {gather_weight}")
+    # print(f"local weight shape {local_weight.shape} {local_weight}")
+    # print(f"gather_flatten_weight shape {gather_flatten_weight.shape} {gather_flatten_weight}")
+    # print(f"V3 gather_flatten_weight shape {gather_flatten_weight.shape} {gather_flatten_weight}")
+    weight_correctness = correctness_verify(weight.data, gather_flatten_weight)
+    bias_correctness = correctness_verify(bias.data, local_bias_flatten.data)
+    if weight_correctness:
+        print(f"V3 weight correctness {weight_correctness}")
+    else:
+        print(f"V3 weight inclued incorrectness value")
+        weight_err_idx = error_idx(weight.data, gather_flatten_weight.data)
+        print(f"V3 weight err idx {weight_err_idx}")
+    if bias_correctness:
+        print(f"V3 bias correctness {bias_correctness}")
+    else:
+        print(f"V3 bias inclued incorrectness value")
+        bias_err_idx = error_idx(bias.data, local_bias_flatten.data)
+        print(f"V3 bias err idx {bias_err_idx}")
+    
+    # print(f"Grad same on {int(os.environ['LOCAL_RANK'])} {torch.all(V2_Global_grad.isclose(V3_Global_grad, rtol=1e-05, atol=1e-04, equal_nan=True))}")
+    # print(f"Update same on {int(os.environ['LOCAL_RANK'])} {torch.all(V2_Global_update.isclose(V3_Global_update, rtol=1e-05, atol=1e-04, equal_nan=True))}")
+    # print(V2_Global_grad)
 
-    # ==============================
-    # Run training epoch
-    # ==============================
-    niter = 100
+    # # ==============================
+    # # Run training epoch
+    # # ==============================
+    niter = 10
+    # runtime test
+    base_start, base_end, base_runtime = 0, 0, 0
+    tp_start, tp_end, tp_runtime, tp_best_runtime = 0, 0, 0, float('inf')
+    zero_start, zero_end, zero_runtime, zero_best_runtime = 0, 0, 0, float('inf')
     for i in range(0, niter):
         # Base optim
         optimizer_base.zero_grad()
@@ -147,40 +225,77 @@ def main():
         
         # TP optim
         optimizer_tp.zero_grad()
-        local_weight.grad = _split(weight.grad)
-        local_bias.grad = bias.grad
+        local_weight.grad = _split(weight.grad).clone()
+        local_bias.grad = bias.grad.clone()
         tp_start = get_time()
         optimizer_tp.step()
         tp_end = get_time()
         gather_weight = _gather(local_weight.data)
         
+        # TP+Zero2 optim
+        optimizer_zero2.zero_grad()
+        local_weight_flatten.grad = _split(weight.grad).clone().flatten()
+        local_bias_flatten.grad = bias.grad.clone().flatten()
+        zero_start = get_time()
+        optimizer_zero2.step()
+        zero_end = get_time()
+        # gather_weight = _gather(local_weight.data)
+        reshape_flatten_weight = local_weight_flatten.view(-1, H // tensor_parallel_size) # reshape
+        gather_flatten_weight = _gather(reshape_flatten_weight.data) # gather
+        
         torch.cuda.synchronize()
-        weight_correctness = correctness_verify(weight.data, gather_weight)
-        bias_correctness = correctness_verify(bias.data, local_bias.data)
+        v2_weight_correctness = correctness_verify(weight.data, gather_weight)
+        v2_bias_correctness = correctness_verify(bias.data, local_bias.data)
+        
+        torch.cuda.synchronize()
+        v3_weight_correctness = correctness_verify(weight.data, gather_flatten_weight)
+        v3_bias_correctness = correctness_verify(bias.data, local_bias_flatten.data)
         
         # print(f"iter {i} weight.data {weight.data}")
         # print(f"iter {i} gather_weight.data {gather_weight.data}")
         
-        print(f"iter {i}")
-        if weight_correctness:
-            print(f"weight correctness {weight_correctness}")
-        else:
-            # print(f"iter {i} weight.data {weight.data}")
-            # print(f"iter {i} gather_weight.data {gather_weight.data}")
-            weight_err_idx = error_idx(weight.data, gather_weight.data)
-            print(f"weight err idx {weight_err_idx}")
+        # print(f"iter {i}")
+        # # v2 tp correctness
+        # if v2_weight_correctness:
+        #     print(f"v2 weight correctness {v2_weight_correctness}")
+        # else:
+        #     print(f"base iter {i} weight.data {weight.data}")
+        #     print(f"v2 iter {i} gather_weight.data {gather_weight.data}")
+        #     print(f"v3 iter {i} gather_flatten_weight.data {gather_flatten_weight.data}")
+        #     weight_err_idx = error_idx(weight.data, gather_weight.data)
+        #     print(f"v2 weight err idx {weight_err_idx}")
+        # if v2_bias_correctness:
+        #     print(f"v2 bias correctness {v2_bias_correctness}")
+        # else:
+        #     bias_err_idx = error_idx(bias.data, local_bias.data)
+        #     print(f"v2 bias err idx {bias_err_idx}")
+            
+            
+        # # v3 tp + zero correctness
+        # if v3_weight_correctness:
+        #     print(f"v3 weight correctness {v3_weight_correctness}")
+        # else:
+        #     # print(f"iter {i} weight.data {weight.data}")
+        #     # print(f"iter {i} gather_weight.data {gather_weight.data}")
+        #     weight_err_idx = error_idx(weight.data, gather_flatten_weight.data)
+        #     print(f"v3 weight err idx {weight_err_idx}")
                 
-        if bias_correctness:
-            print(f"bias correctness {bias_correctness}")
-        else:
-            bias_err_idx = error_idx(bias.data, local_bias.data)
-            print(f"bias err idx {bias_err_idx}")
+        # if v3_bias_correctness:
+        #     print(f"v3 bias correctness {v2_bias_correctness}")
+        # else:
+        #     bias_err_idx = error_idx(bias.data, local_bias_flatten.data)
+        #     print(f"v3 bias err idx {bias_err_idx}")
 
-        print(f"Current base avg runtime {(base_end - base_start) * 10.0**3} ms; Current tp avg runtime {(tp_end - tp_start)*10.0**3} ms")
+
+        print(f"Current base avg runtime {(base_end - base_start) * 10.0**3} ms; Current tp avg runtime {(tp_end - tp_start)*10.0**3} ms; Current zero(tp) avg runtime {(zero_end - zero_start)*10.0**3} ms")
         base_runtime += base_end - base_start
         tp_runtime += tp_end - tp_start
-    print(f"base avg runtime {(base_runtime / niter) * 10.0**3} ms; tp avg runtime {(tp_runtime / niter)*10.0**3} ms")
-    print(f"Speed Up Rate {base_runtime/tp_runtime}")
+        zero_runtime  += zero_end - zero_start
+        tp_best_runtime = min(tp_best_runtime, tp_runtime)
+        zero_best_runtime= min(zero_best_runtime, zero_runtime)
+    print(f"v2 base avg runtime {(base_runtime / niter) * 10.0**3} ms; tp avg runtime {(tp_runtime / niter)*10.0**3} ms; Zero avg runtime {(zero_runtime / niter)*10.0**3} ms;\n")
+    print(f"v2 Avg Speed Up Rate {base_runtime/tp_runtime}; v3 Avg Speed Up Rate {base_runtime/zero_runtime};\n")
+    print(f"v2 Best Speed Up Rate {base_runtime/tp_best_runtime}; v3 Best Speed Up Rate {base_runtime/zero_best_runtime};\n")
     
 if __name__ == "__main__":
     main()

@@ -11,95 +11,19 @@ from mappings import (
     scatter_to_model_parallel_region,
     reduce_from_model_parallel_region,
     gather_from_model_parallel_region,
-    _reduce
+    _reduce,
+    _gather,
+    _split
 )
+
+# V2_Global_grad = torch.empty(4096, 2048)
+# V3_Global_grad = torch.empty(4096, 2048)
+# V2_Global_update = torch.empty(4096, 2048)
+# V3_Global_update = torch.empty(4096, 2048)
+
 
 # Adafactor From transformer.optim
 class Adafactor(Optimizer):
-    """
-    AdaFactor pytorch implementation can be used as a drop in replacement for Adam original fairseq code:
-    https://github.com/pytorch/fairseq/blob/master/fairseq/optim/adafactor.py
-
-    Paper: *Adafactor: Adaptive Learning Rates with Sublinear Memory Cost* https://arxiv.org/abs/1804.04235 Note that
-    this optimizer internally adjusts the learning rate depending on the `scale_parameter`, `relative_step` and
-    `warmup_init` options. To use a manual (external) learning rate schedule you should set `scale_parameter=False` and
-    `relative_step=False`.
-
-    Arguments:
-        params (`Iterable[nn.parameter.Parameter]`):
-            Iterable of parameters to optimize or dictionaries defining parameter groups.
-        lr (`float`, *optional*):
-            The external learning rate.
-        eps (`Tuple[float, float]`, *optional*, defaults to `(1e-30, 0.001)`):
-            Regularization constants for square gradient and parameter scale respectively
-        clip_threshold (`float`, *optional*, defaults to 1.0):
-            Threshold of root mean square of final gradient update
-        decay_rate (`float`, *optional*, defaults to -0.8):
-            Coefficient used to compute running averages of square
-        beta1 (`float`, *optional*):
-            Coefficient used for computing running averages of gradient
-        weight_decay (`float`, *optional*, defaults to 0.0):
-            Weight decay (L2 penalty)
-        scale_parameter (`bool`, *optional*, defaults to `True`):
-            If True, learning rate is scaled by root mean square
-        relative_step (`bool`, *optional*, defaults to `True`):
-            If True, time-dependent learning rate is computed instead of external learning rate
-        warmup_init (`bool`, *optional*, defaults to `False`):
-            Time-dependent learning rate computation depends on whether warm-up initialization is being used
-
-    This implementation handles low-precision (FP16, bfloat) values, but we have not thoroughly tested.
-
-    Recommended T5 finetuning settings (https://discuss.huggingface.co/t/t5-finetuning-tips/684/3):
-
-        - Training without LR warmup or clip_threshold is not recommended.
-
-           - use scheduled LR warm-up to fixed LR
-           - use clip_threshold=1.0 (https://arxiv.org/abs/1804.04235)
-        - Disable relative updates
-        - Use scale_parameter=False
-        - Additional optimizer operations like gradient clipping should not be used alongside Adafactor
-
-    Example:
-
-    ```python
-    Adafactor(model.parameters(), scale_parameter=False, relative_step=False, warmup_init=False, lr=1e-3)
-    ```
-
-    Others reported the following combination to work well:
-
-    ```python
-    Adafactor(model.parameters(), scale_parameter=True, relative_step=True, warmup_init=True, lr=None)
-    ```
-
-    When using `lr=None` with [`Trainer`] you will most likely need to use [`~optimization.AdafactorSchedule`]
-    scheduler as following:
-
-    ```python
-    from transformers.optimization import Adafactor, AdafactorSchedule
-
-    optimizer = Adafactor(model.parameters(), scale_parameter=True, relative_step=True, warmup_init=True, lr=None)
-    lr_scheduler = AdafactorSchedule(optimizer)
-    trainer = Trainer(..., optimizers=(optimizer, lr_scheduler))
-    ```
-
-    Usage:
-
-    ```python
-    # replace AdamW with Adafactor
-    optimizer = Adafactor(
-        model.parameters(),
-        lr=1e-3,
-        eps=(1e-30, 1e-3),
-        clip_threshold=1.0,
-        decay_rate=-0.8,
-        beta1=None,
-        weight_decay=0.0,
-        relative_step=False,
-        scale_parameter=False,
-        warmup_init=False,
-    )
-    ```"""
-
     def __init__(
         self,
         params,
@@ -112,6 +36,8 @@ class Adafactor(Optimizer):
         scale_parameter=True,
         relative_step=True,
         warmup_init=False,
+        param_height = None,
+        param_width = None
     ):
         # require_version("torch>=1.5.0")  # add_ with alpha
         if lr is not None and relative_step:
@@ -131,6 +57,8 @@ class Adafactor(Optimizer):
             "warmup_init": warmup_init,
         }
         super().__init__(params, defaults)
+        self.param_height = param_height
+        self.param_width = param_width
 
     @staticmethod
     def _get_lr(param_group, param_state):
@@ -259,6 +187,8 @@ class Adafactor(Optimizer):
                 state["step"] += 1
                 state["RMS"] = self._rms(p_data_fp32)
                 # print(f"RMS base {state['RMS']}")
+                # if factored:
+                #    print(f"v0 device {0} RMS {state['RMS']}")
                 lr = self._get_lr(group, state)
                 
                 # 参数Beta 2
@@ -275,6 +205,13 @@ class Adafactor(Optimizer):
                     # (Line No.6)计算列指数平均
                     exp_avg_sq_col.mul_(beta2t).add_(update.mean(dim=-2), alpha=(1.0 - beta2t))
                     
+                    
+                    # if factored and int(os.environ['LOCAL_RANK']) == 0:  
+                    #     # print(f"v0 device {int(os.environ['LOCAL_RANK'])} shape {update.shape} update {update} update_mean_dim-1 {update.mean(dim=-1)}")
+                    #     print(f"v0 device {int(os.environ['LOCAL_RANK'])} shape {exp_avg_sq_row.shape} exp_avg_sq_row {exp_avg_sq_row}")
+                    #     # print(f"v0 device {int(os.environ['LOCAL_RANK'])} shape {exp_avg_sq_col.shape} exp_avg_sq_row {exp_avg_sq_col}")
+
+                        
                     # (Line No.7)近似计算，提前开根号
                     # Approximation of exponential moving average of square of gradient
                     update = self._approx_sq_grad(exp_avg_sq_row, exp_avg_sq_col)
@@ -286,6 +223,9 @@ class Adafactor(Optimizer):
                     exp_avg_sq.mul_(beta2t).add_(update, alpha=(1.0 - beta2t))
                     update = exp_avg_sq.rsqrt().mul_(grad)
                 
+                # if factored and int(os.environ['LOCAL_RANK']) == 0:  
+                #     print(f"v0 device {int(os.environ['LOCAL_RANK'])} shape {update.shape} update {update}")
+
                 #  (Line No.8)
                 update.div_((self._rms(update) / group["clip_threshold"]).clamp_(min=1.0))
                 update.mul_(lr)
@@ -297,8 +237,15 @@ class Adafactor(Optimizer):
 
                 if group["weight_decay"] != 0:
                     p_data_fp32.add_(p_data_fp32, alpha=(-group["weight_decay"] * lr))
+                
+                # if factored and int(os.environ['LOCAL_RANK']) == 0:  
+                #     print(f"v0 device {int(os.environ['LOCAL_RANK'])} shape {update.shape} update {update}")
 
+                
                 p_data_fp32.add_(-update)
+                # if factored:  
+                #     print(f"v0 device {int(os.environ['LOCAL_RANK'])} shape {p_data_fp32.shape} p_data_fp32 {p_data_fp32}")
+
 
                 if p.dtype in {torch.float16, torch.bfloat16}:
                     p.copy_(p_data_fp32)
@@ -1048,7 +995,7 @@ class AdafactorTPv02(Optimizer):
                 # grad shape is same as weigh / bias
                 """
                 grad = p.grad.to(self.localRank)
-                # print(f"grad {p.grad}")
+                # print(f"v2 device {self.localRank} shape {grad.shape} grad {grad}")
                 if grad.dtype in {torch.float16, torch.bfloat16}:
                     grad = grad.float()
                 if grad.is_sparse:
@@ -1073,9 +1020,10 @@ class AdafactorTPv02(Optimizer):
                 state = self.state[p]
                 # print(f"state {list(state)}")
                 grad_shape = grad.shape
-                # print(f"grad_shape {grad_shape}")
 
                 factored, use_first_moment = self._get_options(group, grad_shape)
+                # if factored:
+                #     print(f"v2 device {self.localRank} grad_shape {grad_shape}")
                 # print(f"factor {factored}, use_first_moment { use_first_moment}")
                 # State Initialization
                 if len(state) == 0:
@@ -1086,6 +1034,7 @@ class AdafactorTPv02(Optimizer):
                     if factored:
                         state["exp_avg_sq_row"] = torch.zeros(grad_shape[:-1]).to(grad)
                         state["exp_avg_sq_col"] = torch.zeros(grad_shape[:-2] + grad_shape[-1:]).to(grad)
+                        # print(f"v2 row shape {grad_shape[:-1]}, col shape {grad_shape[:-2] + grad_shape[-1:]} {grad_shape[:-2]} {grad_shape[-1:]}")
                     else:
                         state["exp_avg_sq"] = torch.zeros_like(grad)
 
@@ -1105,7 +1054,8 @@ class AdafactorTPv02(Optimizer):
                 
                 state["step"] += 1
                 state["RMS"] = self._rms(p_data_fp32)
-                
+                # if factored:
+                #    print(f"v2 device {self.localRank} RMS {state['RMS']}")
                 # rms_tensor = torch.tensor([self._rms(p_data_fp32)]).to(self.localRank)
                 # dist.all_reduce(rms_tensor, group=fs_init.get_model_parallel_group())
                 # state["RMS"] = rms_tensor.div(self.tensor_parallel_size)[0]
@@ -1123,24 +1073,58 @@ class AdafactorTPv02(Optimizer):
                 # print(f"{state['step'], group['decay_rate'], math.pow(state['step'], group['decay_rate'])}")
                 
                 update = (grad**2) + group["eps"][0]
-                
+
                 if factored:  
+                    # print(f"v2 device {self.localRank} shape {update.shape} update {update}")
                     # 若使用adafactor
                     # print(f"factor\n")
+                    # print(f"v2 device {self.localRank} shape {update.shape} update {update}")
+                    
                     exp_avg_sq_row = state["exp_avg_sq_row"]
                     exp_avg_sq_col = state["exp_avg_sq_col"]
-                    
+                    # print(f"v2 exp_avg_sq_row shape {exp_avg_sq_row.shape}")
+                    # print(f"v2 exp_avg_sq_col shape {exp_avg_sq_col.shape}")
+                    # print(f"v2 update shape {update.shape}")
                     # (Line No.5)计算行指数平均
                     # print(f"------------------------shape {update.mean(dim=-1).shape}")
+                    # [H]
                     exp_avg_sq_row.mul_(beta2t).add_(update.mean(dim=-1), alpha=(1.0 - beta2t))
+                    # [W/N]
                     # (Line No.6)计算列指数平均
                     exp_avg_sq_col.mul_(beta2t).add_(update.mean(dim=-2), alpha=(1.0 - beta2t))
                     
+                    # # before reduce
+                    # if factored:  
+                    #     # print(f"v2 device {self.localRank} shape {update.shape} update {update}")
+                    #     print(f"v2 device {self.localRank} shape {exp_avg_sq_row.shape} exp_avg_sq_row {exp_avg_sq_row} update shape {update.shape} grad shape {grad.shape}")
+                    #     print(f"v2 device {self.localRank} shape {exp_avg_sq_col.shape} exp_avg_sq_col {exp_avg_sq_col}")
+                    #     # print(f"v2 device {self.localRank} shape {exp_avg_sq_row_reduce.shape} exp_avg_sq_row_reduce {exp_avg_sq_row_reduce}")
+                    #     # print(f"v2 device {self.localRank} shape {exp_avg_sq_col_gather.shape} exp_avg_sq_col_gather {exp_avg_sq_col_gather}")
+
+                    
+                    # allreduce row shape [H]
+                    exp_avg_sq_row_reduce = _reduce(None, exp_avg_sq_row).div(self.tensor_parallel_size)
+                    # gather col (actual dont have to)
+                    # exp_avg_sq_col_gather = _gather(exp_avg_sq_col)
+                    
+                    # split to remain shape with update
+                    # exp_avg_sq_row = _split(exp_avg_sq_row_reduce)
+                    # exp_avg_sq_col = _split(exp_avg_sq_col_gather)
+                    # # update 至此与base保持一致
+                    # if factored:  
+                    #     # print(f"v2 device {self.localRank} shape {update.shape} update {update}")
+                    #     # print(f"v2 device {self.localRank} shape {exp_avg_sq_row.shape} exp_avg_sq_row {exp_avg_sq_row}")
+                    #     print(f"v2 device {self.localRank} shape {exp_avg_sq_col.shape} exp_avg_sq_col {exp_avg_sq_col}")
+                    #     print(f"v2 device {self.localRank} shape {exp_avg_sq_row_reduce.shape} exp_avg_sq_row_reduce {exp_avg_sq_row_reduce}")
+                    #     # print(f"v2 device {self.localRank} shape {exp_avg_sq_col_gather.shape} exp_avg_sq_col_gather {exp_avg_sq_col_gather}")
+
                     # (Line No.7)近似计算，提前开根号
                     # Approximation of exponential moving average of square of gradient
-                    update = self._approx_sq_grad(exp_avg_sq_row, exp_avg_sq_col)
+                    # update = self._approx_sq_grad(exp_avg_sq_row, exp_avg_sq_col)
+                    update = self._approx_sq_grad(exp_avg_sq_row_reduce, exp_avg_sq_col)
                     update.mul_(grad)
                     # print(f"{update}")
+                    # print(f"v2 update shape {update.shape} update {update}") # [H, W/N]
                 else:
                     # 若使用adam
                     exp_avg_sq = state["exp_avg_sq"]
@@ -1154,6 +1138,11 @@ class AdafactorTPv02(Optimizer):
                 # # state["RMS"] = rms_update_tensor.div(self.tensor_parallel_size)[0]
                 # update.div_((rms_update_tensor.div(self.tensor_parallel_size)[0] / group["clip_threshold"]).clamp_(min=1.0))
                 
+                
+                # if factored:  
+                #     print(f"v2 device {self.localRank} shape {update.shape} update {update}")
+
+                
                 update.div_((self._rms(update) / group["clip_threshold"]).clamp_(min=1.0))
                 update.mul_(lr)
 
@@ -1165,14 +1154,19 @@ class AdafactorTPv02(Optimizer):
                 if group["weight_decay"] != 0:
                     p_data_fp32.add_(p_data_fp32, alpha=(-group["weight_decay"] * lr))
                 
-                if factored:  
-                    # print(f"Before p_data_fp32 on {self.localRank} {p_data_fp32}")
-                    p_data_fp32.add_(-update)
-                    # print(f"After p_data_fp32 on {self.localRank} {p_data_fp32}")
+                # if factored:  
+                #     print(f"v2 device {self.localRank} shape {update.shape} update {update}")
+
+                
+                p_data_fp32.add_(-update)
+                
+                # if factored:  
+                #     print(f"v2 device {self.localRank} shape {p_data_fp32.shape} p_data_fp32 {p_data_fp32}")
 
                 if p.dtype in {torch.float16, torch.bfloat16}:
                     p.copy_(p_data_fp32)
 
+            # print(f"p shape {p.shape}")
         return loss
 
 # Adafactor Tensor parallel v0.3(zero stage 2, flatten param weight )
@@ -1189,6 +1183,8 @@ class AdafactorTPv03(Optimizer):
         scale_parameter=True,
         relative_step=True,
         warmup_init=False,
+        param_height = None,
+        param_width = None,
     ):
         # require_version("torch>=1.5.0")  # add_ with alpha
         if lr is not None and relative_step:
@@ -1206,8 +1202,17 @@ class AdafactorTPv03(Optimizer):
             "scale_parameter": scale_parameter,
             "relative_step": relative_step,
             "warmup_init": warmup_init,
+            "param_height": param_height,
+            "param_width": param_width,
         }
         super().__init__(params, defaults)
+        self.tensor_parallel_size = fs_init.get_model_parallel_world_size()  # 可用于tensor parallel的GPU
+        self.tensor_parallel_group = fs_init.get_model_parallel_group() # 可用于tensor parallel的Group class
+        self.localRank = int(os.environ['LOCAL_RANK'])  # 当前GPU id
+        self.worldSize = int(os.environ['WORLD_SIZE'])  # 总调用GPU
+        self.param_height = param_height # H
+        self.param_width = param_width  # W
+        self.param_width_parallel = self.param_width // self.tensor_parallel_size # W/N
 
     @staticmethod
     def _get_lr(param_group, param_state):
@@ -1222,7 +1227,13 @@ class AdafactorTPv03(Optimizer):
 
     @staticmethod
     def _get_options(param_group, param_shape):
-        factored = len(param_shape) >= 2
+        tensor_parallel_size = fs_init.get_model_parallel_world_size()  # 可用于tensor parallel的GPU
+        param_shape_flatten = list(param_shape)[0] # param shape
+        check_shape = param_group['param_height'] * param_group['param_width'] // tensor_parallel_size # 判断是否是weight
+        # print(f"param_shape cal {param_group['param_height'] * param_group['param_width'] // tensor_parallel_size}")
+        factored = (len(param_shape) >= 2) or  (param_shape_flatten >= check_shape)
+        # factored = (param_group['param_height'] * param_group['param_width'] // tensor_parallel_size) >= list(param_shape)[0]
+        # print(f"param_shape {param_shape_flatten}, check_shape {check_shape}, factor {factored}")
         use_first_moment = param_group["beta1"] is not None
         return factored, use_first_moment
 
@@ -1287,7 +1298,7 @@ class AdafactorTPv03(Optimizer):
                 # grad shape is same as weigh / bias
                 """
                 grad = p.grad.to(self.localRank)
-                # print(f"grad {p.grad}")
+                # print(f"v3 device {self.localRank} shape {grad.shape} grad {grad}")
                 if grad.dtype in {torch.float16, torch.bfloat16}:
                     grad = grad.float()
                 if grad.is_sparse:
@@ -1309,13 +1320,14 @@ class AdafactorTPv03(Optimizer):
                 'RMS'
                 }
                 """
-                state = self.state[p]
-                # print(f"state {list(state)}")
+                state = self.state[p]  # always empty
                 grad_shape = grad.shape
-                # print(f"grad_shape {grad_shape}")
-
+                
+                # print(f"group {group} grad_shape {grad_shape}")
                 factored, use_first_moment = self._get_options(group, grad_shape)
-                print(f"factor {factored}, use_first_moment { use_first_moment}")
+                # if factored:
+                #     print(f"v3 device {self.localRank} grad_shape {grad_shape}")
+                # print(f"factor {factored}, use_first_moment { use_first_moment}")
                 # State Initialization
                 if len(state) == 0:
                     state["step"] = 0
@@ -1323,8 +1335,12 @@ class AdafactorTPv03(Optimizer):
                         # Exponential moving average of gradient values
                         state["exp_avg"] = torch.zeros_like(grad)
                     if factored:
-                        state["exp_avg_sq_row"] = torch.zeros(grad_shape[:-1]).to(grad)
-                        state["exp_avg_sq_col"] = torch.zeros(grad_shape[:-2] + grad_shape[-1:]).to(grad)
+                        # state["exp_avg_sq_row"] = torch.zeros(grad_shape[:-1]).to(grad)  # [H:4096]
+                        # state["exp_avg_sq_col"] = torch.zeros(grad_shape[:-2] + grad_shape[-1:]).to(grad)  # [W/N:2048]
+                        # print(f"v3 row shape {grad_shape[:-1]}, col shape {grad_shape[:-2] + grad_shape[-1:]}")
+                        state["exp_avg_sq_row"] = torch.zeros(self.param_height).to(grad)  # [H:4096]
+                        state["exp_avg_sq_col"] = torch.zeros(self.param_width_parallel).to(grad)  # [W/N:2048]
+                        # print(f"v3 row shape {state['exp_avg_sq_row'].shape} col shape {state['exp_avg_sq_col'].shape}")
                     else:
                         state["exp_avg_sq"] = torch.zeros_like(grad)
 
@@ -1341,31 +1357,73 @@ class AdafactorTPv03(Optimizer):
                 p_data_fp32 = p.to(self.localRank)
                 if p.dtype in {torch.float16, torch.bfloat16}:
                     p_data_fp32 = p_data_fp32.float()
-                
+                # print(f"v3 update shape {p_data_fp32.shape}") # [H, W/N]
                 state["step"] += 1
                 state["RMS"] = self._rms(p_data_fp32)
                 lr = self._get_lr(group, state)
+                # if factored:
+                #     print(f"v3 device {self.localRank} RMS {state['RMS']}")
                 
                 # 参数Beta 2
                 beta2t = 1.0 - math.pow(state["step"], group["decay_rate"])
-                # print(f"{state['step'], group['decay_rate'], math.pow(state['step'], group['decay_rate'])}")
+                # # print(f"{state['step'], group['decay_rate'], math.pow(state['step'], group['decay_rate'])}")
                 
                 update = (grad**2) + group["eps"][0]
+                # print(f"flatten {p_data_fp32.shape} {update.shape}, factored {factored}")
                 if factored:  
+                    # print(f"v3 device {self.localRank} shape {update.shape} update {update}")
                     # 若使用adafactor
                     # print(f"factor\n")
-                    exp_avg_sq_row = state["exp_avg_sq_row"]
-                    exp_avg_sq_col = state["exp_avg_sq_col"]
+                    # print(f"v3 update shape before {update.shape}") # [H, W/N]
+                    # Clone or raise Runtime error
+                    # update = update.clone().view(-1, self.param_width_parallel)
+                    # p_data_fp32 = p_data_fp32.clone().view(-1, self.param_width_parallel)
+                    # grad = grad.clone().view(-1, self.param_width_parallel)
+                    update_reshape = update.clone().view(-1, self.param_width_parallel)
+                    grad_reshape = grad.clone().view(-1, self.param_width_parallel)
+                    # print(f"v3 device {self.localRank} shape {update.shape} update {update}")
+                   
                     
+                    exp_avg_sq_row = state["exp_avg_sq_row"] # [H]
+                    exp_avg_sq_col = state["exp_avg_sq_col"] # [W/N]
+                    # print(f"v3 exp_avg_sq_row shape {exp_avg_sq_row.shape}")
+                    # print(f"v3 exp_avg_sq_col shape {exp_avg_sq_col.shape}")
+                    # print(f"p_data_fp32 shape {p_data_fp32.shape} {p_data_fp32}")
+                    # print(f"v3 update shape after {update.shape}") # [H, W/N]
                     # (Line No.5)计算行指数平均
-                    exp_avg_sq_row.mul_(beta2t).add_(update.mean(dim=-1), alpha=(1.0 - beta2t))
-                    # (Line No.6)计算列指数平均
-                    exp_avg_sq_col.mul_(beta2t).add_(update.mean(dim=-2), alpha=(1.0 - beta2t))
+                    # exp_avg_sq_row.mul_(beta2t).add_(update.mean(dim=-1), alpha=(1.0 - beta2t))
+                    # # (Line No.6)计算列指数平均
+                    # exp_avg_sq_col.mul_(beta2t).add_(update.mean(dim=-2), alpha=(1.0 - beta2t))
+                    
+                    exp_avg_sq_row.mul_(beta2t).add_(update_reshape.mean(dim=-1), alpha=(1.0 - beta2t))
+                    exp_avg_sq_col.mul_(beta2t).add_(update_reshape.mean(dim=-2), alpha=(1.0 - beta2t))
+                    
+                    exp_avg_sq_row_reduce = _reduce(None, exp_avg_sq_row).div(self.tensor_parallel_size)
+                    # update 至此与base保持一致
+                    # if factored:  
+                    #     # print(f"v3 device {self.localRank} shape {update.shape} update {update}")
+                    #     print(f"v3 device {self.localRank} shape {exp_avg_sq_row.shape} exp_avg_sq_row {exp_avg_sq_row} update shape {update.shape} grad shape {grad.shape}")
+                    #     print(f"v3 device {self.localRank} shape {exp_avg_sq_col.shape} exp_avg_sq_col {exp_avg_sq_col} update shape {update.shape} grad shape {grad.shape}")
+                    
+
+                    # # allreduce row
+                    # exp_avg_sq_row_reduce = _reduce(None, exp_avg_sq_row).div(self.tensor_parallel_size)
+                    # # gather col
+                    # exp_avg_sq_col_gather = _gather(exp_avg_sq_col)
+                    
+                    # # split to remain shape with update
+                    # exp_avg_sq_row = _split(exp_avg_sq_row_reduce)
+                    # exp_avg_sq_col = _split(exp_avg_sq_col_gather)
                     
                     # (Line No.7)近似计算，提前开根号
                     # Approximation of exponential moving average of square of gradient
-                    update = self._approx_sq_grad(exp_avg_sq_row, exp_avg_sq_col)
-                    update.mul_(grad)
+                    # update = self._approx_sq_grad(exp_avg_sq_row_reduce, exp_avg_sq_col)
+                    # update.mul_(grad)
+                    
+                    update_reshape = self._approx_sq_grad(exp_avg_sq_row_reduce, exp_avg_sq_col)
+                    update_reshape.mul_(grad_reshape)
+                    # print(f"v3 update shape {update.shape} update {update}") # [H, W/N]
+                    update = update_reshape.flatten()
                 else:
                     # 若使用adam
                     exp_avg_sq = state["exp_avg_sq"]
@@ -1376,18 +1434,32 @@ class AdafactorTPv03(Optimizer):
                 #  (Line No.8)
                 update.div_((self._rms(update) / group["clip_threshold"]).clamp_(min=1.0))
                 update.mul_(lr)
-
+            
                 if use_first_moment:
                     exp_avg = state["exp_avg"]
                     exp_avg.mul_(group["beta1"]).add_(update, alpha=(1 - group["beta1"]))
                     update = exp_avg
 
                 if group["weight_decay"] != 0:
+                    # print(f"v3 p_data_fp32 shape before {p_data_fp32.shape}") # [H, W/N]
                     p_data_fp32.add_(p_data_fp32, alpha=(-group["weight_decay"] * lr))
+                # print(f"v3 p_data_fp32 shape before {p_data_fp32.shape}") # [H, W/N]
 
-                p_data_fp32.add_(-update)
+                # p_data_fp32 = torch.add(p_data_fp32.flatten(), -update.flatten())
+                p_data_fp32.add_(-update).flatten()
+                # p = p_data_fp32.flatten()
+                # print(f"p_data_fp32 shape {p_data_fp32.shape} {p_data_fp32}")
+                # print(f"v3 p_data_fp32 shape after {p_data_fp32.shape}") # [H, W/N]
+                # print(f"v3 p_data_fp32 after {p_data_fp32}") # [H, W/N]    
+                # if factored:  
+                #     # print(f"v3 device {self.localRank} shape {p_data_fp32.shape} p_data_fp32 {p_data_fp32}")
+                #     pass
+                # else:
+                #     print(f"v3 device {self.localRank} shape {p_data_fp32.shape} p_data_fp32 {p_data_fp32}")
+
 
                 if p.dtype in {torch.float16, torch.bfloat16}:
                     p.copy_(p_data_fp32)
-
+                
+                # print(f"p shape {p.shape} {p}")
         return loss
