@@ -185,7 +185,7 @@ class Adafactor(Optimizer):
                     p_data_fp32 = p_data_fp32.float()
                 
                 state["step"] += 1
-                state["RMS"] = self._rms(p_data_fp32)
+                # state["RMS"] = self._rms(p_data_fp32)
                 # print(f"RMS base {state['RMS']}")
                 # if factored:
                 #    print(f"v0 device {0} RMS {state['RMS']}")
@@ -227,7 +227,7 @@ class Adafactor(Optimizer):
                 #     print(f"v0 device {int(os.environ['LOCAL_RANK'])} shape {update.shape} update {update}")
 
                 #  (Line No.8)
-                update.div_((self._rms(update) / group["clip_threshold"]).clamp_(min=1.0))
+                # update.div_((self._rms(update) / group["clip_threshold"]).clamp_(min=1.0))
                 update.mul_(lr)
 
                 if use_first_moment:
@@ -1053,7 +1053,7 @@ class AdafactorTPv02(Optimizer):
                     p_data_fp32 = p_data_fp32.float()
                 
                 state["step"] += 1
-                state["RMS"] = self._rms(p_data_fp32)
+                # state["RMS"] = self._rms(p_data_fp32)
                 # if factored:
                 #    print(f"v2 device {self.localRank} RMS {state['RMS']}")
                 # rms_tensor = torch.tensor([self._rms(p_data_fp32)]).to(self.localRank)
@@ -1143,7 +1143,7 @@ class AdafactorTPv02(Optimizer):
                 #     print(f"v2 device {self.localRank} shape {update.shape} update {update}")
 
                 
-                update.div_((self._rms(update) / group["clip_threshold"]).clamp_(min=1.0))
+                # update.div_((self._rms(update) / group["clip_threshold"]).clamp_(min=1.0))
                 update.mul_(lr)
 
                 if use_first_moment:
@@ -1186,7 +1186,6 @@ class AdafactorTPv03(Optimizer):
         param_height = None,
         param_width = None,
     ):
-        # require_version("torch>=1.5.0")  # add_ with alpha
         if lr is not None and relative_step:
             raise ValueError("Cannot combine manual `lr` and `relative_step=True` options")
         if warmup_init and not relative_step:
@@ -1359,7 +1358,7 @@ class AdafactorTPv03(Optimizer):
                     p_data_fp32 = p_data_fp32.float()
                 # print(f"v3 update shape {p_data_fp32.shape}") # [H, W/N]
                 state["step"] += 1
-                state["RMS"] = self._rms(p_data_fp32)
+                # state["RMS"] = self._rms(p_data_fp32)
                 lr = self._get_lr(group, state)
                 # if factored:
                 #     print(f"v3 device {self.localRank} RMS {state['RMS']}")
@@ -1432,7 +1431,7 @@ class AdafactorTPv03(Optimizer):
                     update = exp_avg_sq.rsqrt().mul_(grad)
                 
                 #  (Line No.8)
-                update.div_((self._rms(update) / group["clip_threshold"]).clamp_(min=1.0))
+                # update.div_((self._rms(update) / group["clip_threshold"]).clamp_(min=1.0))
                 update.mul_(lr)
             
                 if use_first_moment:

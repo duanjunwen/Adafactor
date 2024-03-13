@@ -39,7 +39,7 @@ def init_dist():
 
 def correctness_verify(tensor1: torch.Tensor, tensor2: torch.Tensor):
     # return torch.all(tensor1.eq(tensor2))
-    return torch.all(tensor1.isclose(tensor2, rtol=1e-05, atol=1e-04, equal_nan=True))
+    return torch.all(tensor1.isclose(tensor2, rtol=1e-05, atol=1e-05, equal_nan=True))
     # return torch.testing.assert_close(tensor1, tensor2,  rtol=1e-05, atol=1e-04, equal_nan=True)
     
 def error_idx(tensor1: torch.Tensor, tensor2: torch.Tensor):
@@ -258,37 +258,37 @@ def main():
         # print(f"iter {i} weight.data {weight.data}")
         # print(f"iter {i} gather_weight.data {gather_weight.data}")
         
-        # print(f"iter {i}")
-        # # v2 tp correctness
-        # if v2_weight_correctness:
-        #     print(f"v2 weight correctness {v2_weight_correctness}")
-        # else:
-        #     print(f"base iter {i} weight.data {weight.data}")
-        #     print(f"v2 iter {i} gather_weight.data {gather_weight.data}")
-        #     print(f"v3 iter {i} gather_flatten_weight.data {gather_flatten_weight.data}")
-        #     weight_err_idx = error_idx(weight.data, gather_weight.data)
-        #     print(f"v2 weight err idx {weight_err_idx}")
-        # if v2_bias_correctness:
-        #     print(f"v2 bias correctness {v2_bias_correctness}")
-        # else:
-        #     bias_err_idx = error_idx(bias.data, local_bias.data)
-        #     print(f"v2 bias err idx {bias_err_idx}")
+        print(f"iter {i}")
+        # v2 tp correctness
+        if v2_weight_correctness:
+            print(f"v2 weight correctness {v2_weight_correctness}")
+        else:
+            # print(f"base iter {i} weight.data {weight.data}")
+            # print(f"v2 iter {i} gather_weight.data {gather_weight.data}")
+            # print(f"v3 iter {i} gather_flatten_weight.data {gather_flatten_weight.data}")
+            weight_err_idx = error_idx(weight.data, gather_weight.data)
+            print(f"v2 weight err idx {weight_err_idx}")
+        if v2_bias_correctness:
+            print(f"v2 bias correctness {v2_bias_correctness}")
+        else:
+            bias_err_idx = error_idx(bias.data, local_bias.data)
+            print(f"v2 bias err idx {bias_err_idx}")
             
             
-        # # v3 tp + zero correctness
-        # if v3_weight_correctness:
-        #     print(f"v3 weight correctness {v3_weight_correctness}")
-        # else:
-        #     # print(f"iter {i} weight.data {weight.data}")
-        #     # print(f"iter {i} gather_weight.data {gather_weight.data}")
-        #     weight_err_idx = error_idx(weight.data, gather_flatten_weight.data)
-        #     print(f"v3 weight err idx {weight_err_idx}")
+        # v3 tp + zero correctness
+        if v3_weight_correctness:
+            print(f"v3 weight correctness {v3_weight_correctness}")
+        else:
+            # print(f"iter {i} weight.data {weight.data}")
+            # print(f"iter {i} gather_weight.data {gather_weight.data}")
+            weight_err_idx = error_idx(weight.data, gather_flatten_weight.data)
+            print(f"v3 weight err idx {weight_err_idx}")
                 
-        # if v3_bias_correctness:
-        #     print(f"v3 bias correctness {v2_bias_correctness}")
-        # else:
-        #     bias_err_idx = error_idx(bias.data, local_bias_flatten.data)
-        #     print(f"v3 bias err idx {bias_err_idx}")
+        if v3_bias_correctness:
+            print(f"v3 bias correctness {v2_bias_correctness}")
+        else:
+            bias_err_idx = error_idx(bias.data, local_bias_flatten.data)
+            print(f"v3 bias err idx {bias_err_idx}")
 
 
         # print(f"Current base avg runtime {(base_end - base_start) * 10.0**3} ms; Current tp avg runtime {(tp_end - tp_start)*10.0**3} ms; Current zero(tp) avg runtime {(zero_end - zero_start)*10.0**3} ms")

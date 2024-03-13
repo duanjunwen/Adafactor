@@ -309,7 +309,7 @@ def main():
         table.add_row(["Version TP+Zero2", weight.shape, bias.shape, (zero_runtime / niter) * 10.0**3, base_runtime/zero_runtime, base_runtime/zero_best_runtime])
     if device == 1:
         print(table)
-        with open('Adafactor_Performance_Test.csv', 'w+', newline='') as file:
+        with open('Adafactor_Performance_Test_2GPU.csv', 'w+', newline='') as file:
             file.write(table.get_csv_string())
 if __name__ == "__main__":
     main()
