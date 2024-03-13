@@ -21,6 +21,8 @@ from mappings import (
     _split,
     _gather
 )
+from prettytable import PrettyTable
+
 
 # dist env
 def init_dist():
@@ -214,6 +216,8 @@ def main():
     base_start, base_end, base_runtime = 0, 0, 0
     tp_start, tp_end, tp_runtime, tp_best_runtime = 0, 0, 0, float('inf')
     zero_start, zero_end, zero_runtime, zero_best_runtime = 0, 0, 0, float('inf')
+    table = PrettyTable(['Version', 'weight shape', 'bias shape', 'Avg runtime(ms)',
+                        'Speed Up Rate', 'Best Speed Up Rate'], float_format='.2')
     for i in range(0, niter):
         # Base optim
         optimizer_base.zero_grad()
@@ -287,15 +291,22 @@ def main():
         #     print(f"v3 bias err idx {bias_err_idx}")
 
 
-        print(f"Current base avg runtime {(base_end - base_start) * 10.0**3} ms; Current tp avg runtime {(tp_end - tp_start)*10.0**3} ms; Current zero(tp) avg runtime {(zero_end - zero_start)*10.0**3} ms")
+        # print(f"Current base avg runtime {(base_end - base_start) * 10.0**3} ms; Current tp avg runtime {(tp_end - tp_start)*10.0**3} ms; Current zero(tp) avg runtime {(zero_end - zero_start)*10.0**3} ms")
         base_runtime += base_end - base_start
         tp_runtime += tp_end - tp_start
         zero_runtime  += zero_end - zero_start
         tp_best_runtime = min(tp_best_runtime, tp_runtime)
         zero_best_runtime= min(zero_best_runtime, zero_runtime)
-    print(f"v2 base avg runtime {(base_runtime / niter) * 10.0**3} ms; tp avg runtime {(tp_runtime / niter)*10.0**3} ms; Zero avg runtime {(zero_runtime / niter)*10.0**3} ms;\n")
-    print(f"v2 Avg Speed Up Rate {base_runtime/tp_runtime}; v3 Avg Speed Up Rate {base_runtime/zero_runtime};\n")
-    print(f"v2 Best Speed Up Rate {base_runtime/tp_best_runtime}; v3 Best Speed Up Rate {base_runtime/zero_best_runtime};\n")
+    # print(f"v2 base avg runtime {(base_runtime / niter) * 10.0**3} ms; tp avg runtime {(tp_runtime / niter)*10.0**3} ms; Zero avg runtime {(zero_runtime / niter)*10.0**3} ms;\n")
+    # print(f"v2 Avg Speed Up Rate {base_runtime/tp_runtime}; v3 Avg Speed Up Rate {base_runtime/zero_runtime};\n")
+    # print(f"v2 Best Speed Up Rate {base_runtime/tp_best_runtime}; v3 Best Speed Up Rate {base_runtime/zero_best_runtime};\n")
     
+    table = PrettyTable(['Version', 'weight shape', 'bias shape', 'Avg runtime(ms)',
+                        'Speed Up Rate', 'Best Speed Up Rate'], float_format='.2')
+    table.add_row(["Version Base", weight.shape, bias.shape, (base_runtime / niter) * 10.0**3, None, None])
+    table.add_row(["Version TP", weight.shape, bias.shape, (tp_runtime / niter)*10.0**3, base_runtime/tp_runtime, base_runtime/tp_best_runtime])
+    table.add_row(["Version TP+Zero2", weight.shape, bias.shape, (zero_runtime / niter) * 10.0**3, base_runtime/tp_best_runtime, base_runtime/zero_best_runtime])
+    
+    print(table)
 if __name__ == "__main__":
     main()
