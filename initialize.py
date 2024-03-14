@@ -68,9 +68,11 @@ def initialize_model_parallel(
     assert _DATA_PARALLEL_GROUP is None, "data parallel group is already initialized"
     for j in range(pipeline_length):
         for k in range(model_parallel_size):
+            # print(f"Curr DP group {groups[:, j, k].tolist()}")
             group = torch.distributed.new_group(groups[:, j, k].tolist(), backend=ddp_backend)
             if j == found[1] and k == found[2]:
                 _DATA_PARALLEL_GROUP = group
+                # print(f"DP group {_DATA_PARALLEL_GROUP}")
 
     # Build the model parallel groups.
     global _MODEL_PARALLEL_GROUP
@@ -88,6 +90,7 @@ def initialize_model_parallel(
     for i in range(data_parallel_size):
         for k in range(model_parallel_size):
             ranks = groups[i, :, k].tolist()
+            # print(f"Curr Rank {rank}")
             group = torch.distributed.new_group(ranks, backend=pipeline_backend)
             if i == found[0] and k == found[2]:
                 _PIPELINE_PARALLEL_GROUP = group

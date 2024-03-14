@@ -1,15 +1,9 @@
 import math
-import torch
-from torch import nn
-import torch.distributed as dist
-from torch.optim import Optimizer
-
-import initialize as fs_init
 import os 
-
-from mappings import (
-    _reduce,
-)
+import torch
+from torch.optim import Optimizer
+import torch.distributed as dist
+import initialize as fs_init
 
 
 # Adafactor From transformer.optim
@@ -299,9 +293,9 @@ class DistributedAdaFactor(Optimizer):
 
     @staticmethod
     def _get_options(param_group, param_shape):
-        tensor_parallel_size = fs_init.get_model_parallel_world_size()  # 可用于tensor parallel的GPU
-        param_shape_flatten = list(param_shape)[0] # param shape
-        check_shape = param_group['param_height'] * param_group['param_width'] // tensor_parallel_size # 判断是否是weight
+        tensor_parallel_size = fs_init.get_model_parallel_world_size() 
+        param_shape_flatten = list(param_shape)[0]
+        check_shape = param_group['param_height'] * param_group['param_width'] // tensor_parallel_size 
         factored = (len(param_shape) >= 2) or  (param_shape_flatten >= check_shape)
         use_first_moment = param_group["beta1"] is not None
         return factored, use_first_moment
@@ -405,14 +399,15 @@ class DistributedAdaFactor(Optimizer):
                 beta2t = 1.0 - math.pow(state["step"], group["decay_rate"])
                 update = (grad**2) + group["eps"][0]
                 if factored:  
-                    update_reshape = update.clone().view(-1, self.param_width_parallel)
-                    grad_reshape = grad.clone().view(-1, self.param_width_parallel)
+                    update_reshape = update.view(-1, self.param_width_parallel)
+                    grad_reshape = grad.view(-1, self.param_width_parallel)
                     exp_avg_sq_row = state["exp_avg_sq_row"] # [H]
                     exp_avg_sq_col = state["exp_avg_sq_col"] # [W/N]
                     exp_avg_sq_row.mul_(beta2t).add_(update_reshape.mean(dim=-1), alpha=(1.0 - beta2t))
                     exp_avg_sq_col.mul_(beta2t).add_(update_reshape.mean(dim=-2), alpha=(1.0 - beta2t))
-                    exp_avg_sq_row_reduce = _reduce(None, exp_avg_sq_row).div(self.tensor_parallel_size)
-                    update_reshape = self._approx_sq_grad(exp_avg_sq_row_reduce, exp_avg_sq_col)
+                    dist.all_reduce(exp_avg_sq_row, group=self.tensor_parallel_group)
+                    exp_avg_sq_row.div_(self.tensor_parallel_size)
+                    update_reshape = self._approx_sq_grad(exp_avg_sq_row, exp_avg_sq_col)
                     update_reshape.mul_(grad_reshape)
                     update = update_reshape.flatten()
                 else:
@@ -420,7 +415,7 @@ class DistributedAdaFactor(Optimizer):
                     exp_avg_sq.mul_(beta2t).add_(update, alpha=(1.0 - beta2t))
                     update = exp_avg_sq.rsqrt().mul_(grad)
                 
-                #  (Line No.8) RMS
+                # (Line No.8) RMS
                 # update.div_((self._rms(update) / group["clip_threshold"]).clamp_(min=1.0))
                 update.mul_(lr)
             
@@ -431,6 +426,7 @@ class DistributedAdaFactor(Optimizer):
 
                 if group["weight_decay"] != 0:
                     p_data_fp32.add_(p_data_fp32, alpha=(-group["weight_decay"] * lr))
+                
                 p_data_fp32.add_(-update).flatten()
                 
                 if p.dtype in {torch.float16, torch.bfloat16}:

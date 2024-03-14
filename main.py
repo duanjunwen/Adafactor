@@ -10,7 +10,6 @@ from adafactor import (
     DistributedAdaFactor,
 )
 import initialize as fs_init
-
 from mappings import (
     _split,
     _gather
@@ -108,7 +107,7 @@ def main():
     # # ==============================
     # # Run training epoch
     # # ==============================
-    niter = 10
+    niter = 30
     # runtime test
     base_start, base_end, base_runtime = 0, 0, 0
     zero_start, zero_end, zero_runtime, zero_best_runtime = 0, 0, 0, float('inf')
@@ -165,5 +164,6 @@ def main():
     table.add_row(["DistributedAdaFactor", weight.shape, bias.shape, (zero_runtime / niter) * 10.0**3, base_runtime/zero_runtime ,base_runtime/zero_best_runtime])
     
     print(table)
+
 if __name__ == "__main__":
     main()
