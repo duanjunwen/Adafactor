@@ -2,9 +2,7 @@ import os
 import time
 import torch
 from torch import nn
-from torch.nn.parameter import Parameter
 import torch.distributed as dist
-# import torch.optim as optim
 from adafactor import (
     Adafactor, 
     DistributedAdaFactor,
@@ -56,7 +54,7 @@ def main():
     device = int(os.environ['LOCAL_RANK'])
     world_size = int(os.environ['WORLD_SIZE'])
     init_dist()
-    tensor_parallel_size = fs_init.get_model_parallel_world_size() 
+    tensor_parallel_size = world_size
     
     H, W = 4, 4
     model_base = nn.Linear(H, W).to(device)  
@@ -67,19 +65,22 @@ def main():
     # bias [W]  [4]
     weight, bias = model_base.weight, model_base.bias
     # physical_mesh_id: torch.Tensor[0,1,2,3]
-    # logical_mesh_id: 2 GPU view as (1,2); 4 GPU view as (1,4) or (2,2)
-    # device_mesh = DeviceMesh(torch.Tensor([i for i in range(world_size)]), (1, 2), init_process_group=True)
-    # sharding_spec = ShardingSpec(dim_size=weight.dim(), dim_partition_dict={weight.dim() - 1: [1]})
-    # weight_shard = distribute_tensor(weight, device_mesh, sharding_spec)
+    # logical_mesh_id: (DP size, TP size); WORLD SIZE = DP size, TP size; 2 GPU view as (1,2); 4 GPU view as (1,4) or (2,2)
+    device_mesh = DeviceMesh(torch.Tensor([i for i in range(world_size)]), (1, tensor_parallel_size), init_process_group=True)
+    sharding_spec = ShardingSpec(dim_size=weight.dim(), dim_partition_dict={weight.dim() - 1: [1]})
+    weight_shard = distribute_tensor(weight, device_mesh, sharding_spec)
+
     # print(f"device_mesh {device_mesh}")
-    # print(f"sharding_spec {sharding_spec}")
+    # print(f"process Group decie {device} {device_mesh.get_process_group(axis=0)}")
+    # print(f"tp size {device_mesh._physical_mesh_id.shape[0]}")
+    # print(f"_ranks_in_the_process_group {device_mesh._ranks_in_the_process_group}")
     # print(f"weight on device {device} {weight}")
     # print(f"weight_shard on device {device} {weight_shard}")
     
     # local_weight [W*H/N] [4*1]
     # local_bias [W]  [4]
     # flatten param; TP first, then flatten ;
-    local_weight_flatten = nn.Parameter(_split(weight).clone().flatten().requires_grad_(True))
+    local_weight_flatten = nn.Parameter(weight_shard.clone().flatten().requires_grad_(True))
     local_bias_flatten = nn.Parameter(bias.clone().flatten().requires_grad_(True))
 
 
@@ -97,7 +98,7 @@ def main():
     # # Adafactor Tensor Parallel v0.3
     # # ==============================
     torch.cuda.synchronize()
-    optimizer_zero2 = DistributedAdaFactor([local_weight_flatten, local_bias_flatten], param_height = W, param_width = H)
+    optimizer_zero2 = DistributedAdaFactor([local_weight_flatten, local_bias_flatten], param_height = W, param_width = H, device_mesh=device_mesh, sharding_spec=sharding_spec)
     optimizer_zero2.zero_grad()
     local_weight_flatten.grad = _split(weight.grad).clone().flatten()
     local_bias_flatten.grad = bias.grad.clone().flatten()
@@ -128,7 +129,7 @@ def main():
     # # ==============================
     # # Run training epoch
     # # ==============================
-    niter = 1
+    niter = 30
     # runtime test
     base_start, base_end, base_runtime = 0, 0, 0
     zero_start, zero_end, zero_runtime, zero_best_runtime = 0, 0, 0, float('inf')

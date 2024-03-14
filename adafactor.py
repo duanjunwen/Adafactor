@@ -3,17 +3,7 @@ import os
 import torch
 from torch.optim import Optimizer
 import torch.distributed as dist
-import initialize as fs_init
-from colossalai.tensor.d_tensor import (
-    distribute_tensor,
-    distribute_tensor_with_customization,
-    get_device_mesh,
-    get_sharding_spec,
-    init_as_dtensor,
-    init_tensor_as_customization_distributed,
-    is_customized_distributed_tensor,
-    is_distributed_tensor,
-)
+# import initialize as fs_init
 
 
 # Adafactor From transformer.optim
@@ -262,6 +252,8 @@ class DistributedAdaFactor(Optimizer):
         warmup_init=False,
         param_height = None,
         param_width = None,
+        device_mesh = None,
+        sharding_spec = None
     ):
         if lr is not None and relative_step:
             raise ValueError("Cannot combine manual `lr` and `relative_step=True` options")
@@ -280,10 +272,15 @@ class DistributedAdaFactor(Optimizer):
             "warmup_init": warmup_init,
             "param_height": param_height,
             "param_width": param_width,
+            "device_mesh": device_mesh,
+            "sharding_spec": sharding_spec
         }
         super().__init__(params, defaults)
-        self.tensor_parallel_size = fs_init.get_model_parallel_world_size() 
-        self.tensor_parallel_group = fs_init.get_model_parallel_group()
+        # self.tensor_parallel_size = fs_init.get_model_parallel_world_size() 
+        # self.tensor_parallel_group = fs_init.get_model_parallel_group()
+        self.tensor_parallel_size = device_mesh._physical_mesh_id.shape[0]
+        self.tensor_parallel_group = device_mesh.get_process_group(axis=1) # "Expected row process group"
+        # print(f"tensor_parallel_group {self.tensor_parallel_group}")
         self.localRank = int(os.environ['LOCAL_RANK']) 
         self.worldSize = int(os.environ['WORLD_SIZE']) 
         self.param_height = param_height # H
@@ -302,8 +299,9 @@ class DistributedAdaFactor(Optimizer):
         return param_scale * rel_step_sz
 
     @staticmethod
-    def _get_options(param_group, param_shape):
-        tensor_parallel_size = fs_init.get_model_parallel_world_size() 
+    def _get_options(param_group, param_shape, tensor_parallel_size):
+        # tensor_parallel_size = fs_init.get_model_parallel_world_size() 
+        # tensor_parallel_size = self.tensor_parallel_size._physical_mesh_id.shape[0]
         param_shape_flatten = list(param_shape)[0]
         check_shape = param_group['param_height'] * param_group['param_width'] // tensor_parallel_size 
         factored = (len(param_shape) >= 2) or  (param_shape_flatten >= check_shape)
@@ -380,7 +378,7 @@ class DistributedAdaFactor(Optimizer):
                 """
                 state = self.state[p]  # always empty
                 grad_shape = grad.shape
-                factored, use_first_moment = self._get_options(group, grad_shape)
+                factored, use_first_moment = self._get_options(group, grad_shape, self.tensor_parallel_size)
                 if len(state) == 0:
                     state["step"] = 0
                     if use_first_moment:
