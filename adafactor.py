@@ -4,6 +4,16 @@ import torch
 from torch.optim import Optimizer
 import torch.distributed as dist
 import initialize as fs_init
+from colossalai.tensor.d_tensor import (
+    distribute_tensor,
+    distribute_tensor_with_customization,
+    get_device_mesh,
+    get_sharding_spec,
+    init_as_dtensor,
+    init_tensor_as_customization_distributed,
+    is_customized_distributed_tensor,
+    is_distributed_tensor,
+)
 
 
 # Adafactor From transformer.optim

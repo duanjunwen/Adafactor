@@ -15,6 +15,16 @@ from mappings import (
     _gather
 )
 from prettytable import PrettyTable
+from colossalai.tensor.d_tensor import (
+    distribute_tensor,
+    distribute_tensor_with_customization,
+    get_device_mesh,
+    get_sharding_spec,
+    init_as_dtensor,
+    init_tensor_as_customization_distributed,
+    is_customized_distributed_tensor,
+    is_distributed_tensor,
+)
 
 
 # dist env
@@ -107,7 +117,7 @@ def main():
     # # ==============================
     # # Run training epoch
     # # ==============================
-    niter = 30
+    niter = 1
     # runtime test
     base_start, base_end, base_runtime = 0, 0, 0
     zero_start, zero_end, zero_runtime, zero_best_runtime = 0, 0, 0, float('inf')
