@@ -42,7 +42,6 @@ def error_idx(tensor1: torch.Tensor, tensor2: torch.Tensor):
 def get_time():
     torch.cuda.synchronize()
     return time.time()
-
 def main():
     # ==============================
     # torch distributed init
@@ -56,9 +55,8 @@ def main():
     # ==============================
     # Col Parallel Param Info
     # ==============================
-    H, W = 4, 4
+    H, W = 4096, 4096
     model_col = nn.Linear(H, W).to(device) # Col parallel weight  
-    
     
     # ==============================
     # Param init
@@ -75,62 +73,65 @@ def main():
     device_mesh = DeviceMesh(torch.Tensor([i for i in range(world_size)]), (1, tensor_parallel_size), init_process_group=True)
     sharding_spec = ShardingSpec(dim_size=weight.dim(), dim_partition_dict={weight.dim() - 1: [1]})
     weight_shard = distribute_tensor(weight, device_mesh, sharding_spec)
-    # print(f"sharding_spec {list(sharding_spec.sharding_sequence)}")
-    # print(f"weight_shard {weight_shard.shape}") 
     # local_weight [W*H/N] [4*1]
     # local_bias [W]  [4]
-    # flatten param; TP first, then flatten ;
     local_weight_flatten = nn.Parameter(weight_shard.clone().flatten().requires_grad_(True))
     local_bias_flatten = nn.Parameter(bias.clone().flatten().requires_grad_(True))
+    # print(f"weight shape len {len(weight.shape)} {weight.shape}; bias len {len(bias.shape)} shape {bias.shape}")
+    # params_shape = [weight.shape, bias.shape]
+    params_shape = {id(local_weight_flatten): weight.shape, id(local_bias_flatten): bias.shape}
+    sharding_spec_dict = {id(local_weight_flatten): sharding_spec, id(local_bias_flatten): None}
+    # print(f"params_shape device{device} {params_shape}")
+    # print(f"Type sharding_spec {type(sharding_spec)}")
     
+    # ==============================
+    # Adafactor Base (For Coloumn Parallel)
+    # ==============================
+    torch.cuda.synchronize()
+    optimizer_base = Adafactor([weight, bias])
+    optimizer_base.zero_grad()
+    weight.grad = torch.rand_like(weight)
+    bias.grad = torch.rand_like(bias)
+    optimizer_base.step()
 
-
-    # # ==============================
-    # # Adafactor Base (For Coloumn Parallel)
-    # # ==============================
-    # torch.cuda.synchronize()
-    # optimizer_base = Adafactor([weight, bias])
-    # optimizer_base.zero_grad()
-    # weight.grad = torch.rand_like(weight)
-    # bias.grad = torch.rand_like(bias)
-    # optimizer_base.step()
-
-    # # ==============================
-    # # DistributedAdafactor (Coloumn Parallel)
-    # # ==============================
-    # torch.cuda.synchronize()
-    # optimizer_zero2 = DistributedAdaFactor([local_weight_flatten, local_bias_flatten], param_height = W, param_width = H, device_mesh=device_mesh, sharding_spec=sharding_spec)
-    # optimizer_zero2.zero_grad()
-    # local_weight_flatten.grad = distribute_tensor(weight.grad, device_mesh, sharding_spec).clone().flatten()
-    # local_bias_flatten.grad = bias.grad.clone().flatten()
-    # optimizer_zero2.step()
+    # ==============================
+    # DistributedAdafactor (Coloumn Parallel)
+    # ==============================
+    torch.cuda.synchronize()
+    optimizer_zero2 = DistributedAdaFactor([local_weight_flatten, local_bias_flatten])
+    optimizer_zero2.setup_distribute(device_mesh=device_mesh, sharding_spec_dict=sharding_spec_dict, param_shape = params_shape)
+    optimizer_zero2.zero_grad()
+    local_weight_flatten.grad = distribute_tensor(weight.grad, device_mesh, sharding_spec).clone().flatten()
+    local_bias_flatten.grad = bias.grad.clone().flatten()
+    optimizer_zero2.step()
     
-    # # ==============================
-    # # Correctness Verify (Column Parallel)
-    # # ==============================
-    # # tensor parallel & flatten view &gather data (Coloumn Parallel)
-    # torch.cuda.synchronize()
-    # reshape_flatten_weight = local_weight_flatten.view(-1, H // tensor_parallel_size) # reshape
-    # gather_flatten_weight = _gather(reshape_flatten_weight.data, device_mesh.get_process_group(axis=1)) # gather
-    # weight_correctness = correctness_verify(weight.data, gather_flatten_weight)
-    # bias_correctness = correctness_verify(bias.data, local_bias_flatten.data)
-    # if weight_correctness:
-    #     print(f"Distributed weight (Column Parallel) correctness Pass")
-    # else:
-    #     print(f"Distributed weight (Column Parallel) inclued incorrectness value")
-    #     weight_err_idx = error_idx(weight.data, gather_flatten_weight.data)
-    #     print(f"Distributed weight (Column Parallel) err idx {weight_err_idx}")
-    # if bias_correctness:
-    #     print(f"Distributed bias (Column Parallel) correctness Pass")
-    # else:
-    #     print(f"Distributed bias (Column Parallel) inclued incorrectness value")
-    #     bias_err_idx = error_idx(bias.data, local_bias_flatten.data)
-    #     print(f"Distributed bias (Column Parallel) err idx {bias_err_idx}")
+    # ==============================
+    # Correctness Verify (Column Parallel)
+    # ==============================
+    # tensor parallel & flatten view &gather data (Coloumn Parallel)
+    torch.cuda.synchronize()
+    reshape_flatten_weight = local_weight_flatten.view(-1, H // tensor_parallel_size) # reshape
+    gather_flatten_weight = _gather(reshape_flatten_weight.data, device_mesh.get_process_group(axis=1)) # gather
+    weight_correctness = correctness_verify(weight.data, gather_flatten_weight)
+    bias_correctness = correctness_verify(bias.data, local_bias_flatten.data)
+    # print(f"weight_correctness {weight_correctness}")
+    if weight_correctness:
+        print(f"Distributed weight (Column Parallel) correctness Pass")
+    else:
+        print(f"Distributed weight (Column Parallel) inclued incorrectness value")
+        weight_err_idx = error_idx(weight.data, gather_flatten_weight.data)
+        print(f"Distributed weight (Column Parallel) err idx {weight_err_idx}")
+    if bias_correctness:
+        print(f"Distributed bias (Column Parallel) correctness Pass")
+    else:
+        print(f"Distributed bias (Column Parallel) inclued incorrectness value")
+        bias_err_idx = error_idx(bias.data, local_bias_flatten.data)
+        print(f"Distributed bias (Column Parallel) err idx {bias_err_idx}")
         
     # # ==============================
-    # # Runtime Test
+    # # Runtime Test (col Parallel)
     # # ==============================
-    # niter = 10
+    # niter = 50
     # base_start, base_end, base_runtime = 0, 0, 0
     # zero_start, zero_end, zero_runtime, zero_best_runtime = 0, 0, 0, float('inf')
     # table = PrettyTable(['Version', 'weight shape', 'bias shape', 'Avg runtime(ms)',
@@ -162,18 +163,18 @@ def main():
         
     #     print(f"iter {i}")
     #     if v3_weight_correctness:
-    #         print(f"Distributed weight correctness Pass")
+    #         print(f"Distributed weight (Column Parallel) correctness Pass")
     #     else:
-    #         print(f"Distributed weight inclued incorrectness value")
+    #         print(f"Distributed weight (Column Parallel) inclued incorrectness value")
     #         weight_err_idx = error_idx(weight.data, gather_flatten_weight.data)
-    #         print(f"Distributed weight err idx {weight_err_idx}")
+    #         print(f"Distributed weight (Column Parallel) err idx {weight_err_idx}")
                 
     #     if v3_bias_correctness:
-    #         print(f"Distributed bias correctness Pass")
+    #         print(f"Distributed bias (Column Parallel) correctness Pass")
     #     else:
-    #         print(f"Distributed bias inclued incorrectness value")
+    #         print(f"Distributed bias (Column Parallel) inclued incorrectness value")
     #         bias_err_idx = error_idx(bias.data, local_bias_flatten.data)
-    #         print(f"Distributed bias err idx {bias_err_idx}")
+    #         print(f"Distributed bias (Column Parallel) err idx {bias_err_idx}")
 
 
     #     base_runtime += base_end - base_start
@@ -183,9 +184,10 @@ def main():
     # table = PrettyTable(['Version','iter', 'weight shape', 'bias shape', 'Avg runtime(ms)',
     #                     'Avg Speed Up Rate', 'Best Speed Up Rate'], float_format='.2')
     # table.add_row(["AdaFactor", niter, weight.shape, bias.shape, (base_runtime / niter) * 10.0**3, None, None])
-    # table.add_row(["DistributedAdaFactor", niter, weight.shape, bias.shape, (zero_runtime / niter) * 10.0**3, base_runtime/zero_runtime ,base_runtime/zero_best_runtime])
+    # table.add_row(["DistributedAdaFactor (Col Parallel)", niter, weight.shape, bias.shape, (zero_runtime / niter) * 10.0**3, base_runtime/zero_runtime ,base_runtime/zero_best_runtime])
     
     # print(table)
+    
     
         
     # ==============================
@@ -200,6 +202,8 @@ def main():
     # print(f"sharding_spec_row {list(sharding_spec_row.sharding_sequence)}")
     local_weight_row_flatten = nn.Parameter(weight_row_shard.clone().flatten().requires_grad_(True))
     local_bias_row_flatten = nn.Parameter(bias_row.clone().flatten().requires_grad_(True))
+    params_shape_row = {id(local_weight_row_flatten): weight.shape, id(local_bias_row_flatten): bias.shape}
+    sharding_spec_row_dict = {id(local_weight_row_flatten): sharding_spec_row, id(local_bias_row_flatten): None}
     # if device == 0:
     #     print(f'weight_row {weight_row}')
     # print(f"weight_row_shard device {device} {weight_row_shard}") 
@@ -214,41 +218,111 @@ def main():
     bias_row.grad = torch.rand_like(bias_row)
     optimizer_base.step()
     # if device == 0:
-    #     print(f'weight_row.grad {weight_row.grad}')
+    #     print(f'weight_row {weight_row}')
     
     # ==============================
     # DistributedAdafactor (Row Parallel)
     # ==============================
     torch.cuda.synchronize()
-    optimizer_zero2 = DistributedAdaFactor([local_weight_row_flatten, local_bias_row_flatten], param_height = H, param_width = W, device_mesh=device_mesh_row, sharding_spec=sharding_spec_row)
+    optimizer_zero2 = DistributedAdaFactor([local_weight_row_flatten, local_bias_row_flatten])
+    optimizer_zero2.setup_distribute(device_mesh=device_mesh_row, sharding_spec_dict=sharding_spec_row_dict, param_shape = params_shape_row)
     optimizer_zero2.zero_grad()
     local_weight_row_flatten.grad = distribute_tensor(weight_row.grad, device_mesh_row, sharding_spec_row).clone().flatten()
     local_bias_row_flatten.grad = bias_row.grad.clone().flatten()
     optimizer_zero2.step()
+    # print(f'local_weight_row_flatten {local_weight_row_flatten}')
     
     
     # print(f"local_weight_row_flatten.grad device {device} {local_weight_row_flatten.grad}") 
     
+    # ==============================
+    # Correctness Verify (Row Parallel)
+    # ==============================
+    torch.cuda.synchronize()
+    gather_flatten_weight_row = _gather(local_weight_row_flatten.data, device_mesh_row.get_process_group(axis=1)) # gather
+    # print(f'gather_flatten_weight_row reshape {gather_flatten_weight_row}')
+    reshape_flatten_weight_row = gather_flatten_weight_row.view(-1, W) # reshape
+    # print(f'reshape_flatten_weight_row reshape {reshape_flatten_weight_row}')
+
+    weight_correctness = correctness_verify(weight_row.data, reshape_flatten_weight_row)
+    bias_correctness = correctness_verify(bias_row.data, local_bias_row_flatten.data)
+    if weight_correctness:
+        print(f"Distributed weight (Row Parallel) correctness Pass")
+    else:
+        print(f"Distributed weight (Row Parallel) inclued incorrectness value")
+        weight_err_idx = error_idx(weight_row.data, reshape_flatten_weight_row.data)
+        print(f"Distributed weight err idx {weight_err_idx}")
+    if bias_correctness:
+        print(f"Distributed bias (Row Parallel) correctness Pass")
+    else:
+        print(f"Distributed bias (Row Parallel) inclued incorrectness value")
+        bias_err_idx = error_idx(bias_row.data, local_bias_row_flatten.data)
+        print(f"Distributed bias (Row Parallel) err idx {bias_err_idx}")
+            
     # # ==============================
-    # # Correctness Verify (Row Parallel)
+    # # Runtime Test (Row Parallel)
     # # ==============================
-    # torch.cuda.synchronize()
-    # reshape_flatten_weight_row = local_weight_row_flatten.view(-1, H // tensor_parallel_size) # reshape
-    # gather_flatten_weight_row = _gather(reshape_flatten_weight_row.data, device_mesh.get_process_group(axis=1)) # gather
-    # weight_correctness = correctness_verify(weight_row.data, gather_flatten_weight_row)
-    # bias_correctness = correctness_verify(bias_row.data, local_bias_row_flatten.data)
-    # if weight_correctness:
-    #     print(f"Distributed weight (Row Parallel) correctness Pass")
-    # else:
-    #     print(f"Distributed weight (Row Parallel) inclued incorrectness value")
-    #     weight_err_idx = error_idx(weight_row.data, gather_flatten_weight_row.data)
-    #     print(f"Distributed weight err idx {weight_err_idx}")
-    # if bias_correctness:
-    #     print(f"Distributed bias (Row Parallel) correctness Pass")
-    # else:
-    #     print(f"Distributed bias (Row Parallel) inclued incorrectness value")
-    #     bias_err_idx = error_idx(bias_row.data, local_bias_row_flatten.data)
-    #     print(f"Distributed bias (Row Parallel) err idx {bias_err_idx}")
+    # niter = 50
+    # base_start, base_end, base_runtime = 0, 0, 0
+    # zero_start, zero_end, zero_runtime, zero_best_runtime = 0, 0, 0, float('inf')
+    # table = PrettyTable(['Version', 'weight shape', 'bias shape', 'Avg runtime(ms)',
+    #                     'Speed Up Rate', 'Best Speed Up Rate'], float_format='.2')
+    # for i in range(0, niter):
+    #     # Base Adafactor
+    #     optimizer_base.zero_grad()
+    #     weight_row.grad = torch.rand_like(weight_row)
+    #     bias_row.grad = torch.rand_like(bias_row)
+    #     base_start = get_time()
+    #     optimizer_base.step()
+    #     base_end = get_time()
+        
+    #     # Distributed Adafactor
+    #     optimizer_zero2.zero_grad()
+    #     # local_weight_flatten.grad = distribute_tensor(weight_row.grad, device_mesh, sharding_spec).clone().flatten()
+    #     # local_bias_flatten.grad = bias_row.grad.clone().flatten()
+    #     local_weight_row_flatten.grad = distribute_tensor(weight_row.grad, device_mesh_row, sharding_spec_row).clone().flatten()
+    #     local_bias_row_flatten.grad = bias_row.grad.clone().flatten()
+    #     zero_start = get_time()
+    #     optimizer_zero2.step()
+    #     zero_end = get_time()
+    
+    #     torch.cuda.synchronize()
+    #     gather_flatten_weight_row = _gather(local_weight_row_flatten.data, device_mesh_row.get_process_group(axis=1)) # gather
+    #     # print(f'gather_flatten_weight_row reshape {gather_flatten_weight_row}')
+    #     reshape_flatten_weight_row = gather_flatten_weight_row.view(-1, W) # reshape
+    #     # print(f'reshape_flatten_weight_row reshape {reshape_flatten_weight_row}')
+
+    #     weight_correctness = correctness_verify(weight_row.data, reshape_flatten_weight_row)
+    #     bias_correctness = correctness_verify(bias_row.data, local_bias_row_flatten.data)
+        
+        
+    #     print(f"iter {i}")
+    #     if weight_correctness:
+    #         print(f"Distributed weight (Row Parallel) correctness Pass")
+    #     else:
+    #         print(f"Distributed weight (Row Parallel) inclued incorrectness value")
+    #         weight_err_idx = error_idx(weight_row.data, reshape_flatten_weight_row.data)
+    #         print(f"Distributed weight (Row Parallel) err idx {weight_err_idx}")
+                
+    #     if bias_correctness:
+    #         print(f"Distributed bias (Row Parallel) correctness Pass")
+    #     else:
+    #         print(f"Distributed bias (Row Parallel) inclued incorrectness value")
+    #         bias_err_idx = error_idx(bias_row.data, local_bias_row_flatten.data)
+    #         print(f"Distributed bias (Row Parallel) err idx {bias_err_idx}")
+
+
+    #     base_runtime += base_end - base_start
+    #     zero_runtime  += zero_end - zero_start
+    #     zero_best_runtime= min(zero_best_runtime, zero_runtime)
+
+    # table = PrettyTable(['Version','iter', 'weight shape', 'bias shape', 'Avg runtime(ms)',
+    #                     'Avg Speed Up Rate', 'Best Speed Up Rate'], float_format='.2')
+    # table.add_row(["AdaFactor", niter, weight_row.shape, bias_row.shape, (base_runtime / niter) * 10.0**3, None, None])
+    # table.add_row(["DistributedAdaFactor (Row Parallel)", niter, weight_row.shape, bias_row.shape, (zero_runtime / niter) * 10.0**3, base_runtime/zero_runtime ,base_runtime/zero_best_runtime])
+    
+    # print(table)
+
 
 if __name__ == "__main__":
     main()
